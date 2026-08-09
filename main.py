@@ -9,34 +9,6 @@ from constant import *
 
 pygame.init()
 
-# ===== 音效系统 =====
-SOUND_DIR = os.path.join(os.path.dirname(__file__), 'assets', 'sounds')
-
-# 强度 → 音调 (click_stereo)
-TAP_SOUNDS = {
-    1: 'click_stereo_x1.05.ogg',
-    2: 'click_stereo_x1.10.ogg',
-    3: 'click_stereo_x1.15.ogg',
-    4: 'click_stereo_x1.20.ogg',
-    5: 'click_stereo_x1.25.ogg',
-}
-
-# 切割：6 个变调全随机
-SHEAR_SOUNDS = [
-    'shear_x0.90.ogg', 'shear_x0.95.ogg', 'shear_x1.00.ogg',
-    'shear_x1.05.ogg', 'shear_x1.10.ogg', 'shear_x1.15.ogg',
-]
-
-# 点数包：按分值分段，每段 2 个随机
-ORB_SOUNDS = {
-    1: ['orb_x0.90.ogg', 'orb_x0.95.ogg'],
-    2: ['orb_x1.00.ogg', 'orb_x1.05.ogg'],
-    3: ['orb_x1.10.ogg', 'orb_x1.15.ogg'],
-}
-
-# 按钮：固定 x1.00
-CLICK_SOUND = 'click_stereo_x1.00.ogg'
-
 _sfx_bank = {}         # {filename: Sound}
 _sfx_debug_log = []    # 调试模式：[(filename, tick), ...]
 DEBUG_MODE = os.path.isfile(os.path.join(os.path.dirname(__file__), 'debug'))
@@ -94,6 +66,7 @@ def play_sfx(name, **kwargs):
     _play_file(fname)
 
 
+# ===== 音效系统 =====
 _load_all_sfx()
 # ===== 音效系统 END =====
 
@@ -146,7 +119,7 @@ def _draw_aa_circle_outline(surface, color, center, radius, width=1):
 
 
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption("Binary Tree Battle - 二叉树战斗")
+pygame.display.set_caption(f"Binary Tree Battle - {VERSION}")
 clock = pygame.time.Clock()
 
 
@@ -959,6 +932,10 @@ class Game:
         surface.blit(font_mid.render("加入房间", True, WHITE),
                      font_mid.render("加入房间", True, WHITE).get_rect(center=btn4.center))
         self._btn_join = btn4
+
+        # 右下角版本号与作者
+        ver_text = font_tiny.render(f"{VERSION}  by {AUTHOR}", True, (80, 80, 100))
+        surface.blit(ver_text, (SCREEN_WIDTH - ver_text.get_width() - 12, SCREEN_HEIGHT - 22))
 
     # ===== 游戏结束绘制 =====
     def draw_game_over(self, surface):

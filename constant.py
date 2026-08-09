@@ -2,6 +2,9 @@
 import os
 import sys
 
+VERSION = "v1.3"
+AUTHOR = "Lzdqesj"
+
 SCREEN_WIDTH, SCREEN_HEIGHT = 1300, 700
 FPS = 60
 NODE_RADIUS = 18
@@ -52,6 +55,34 @@ STATE_CLIENT_WAIT = 'client_wait'  # 客户端等待房主开始
 STATE_JOIN_INPUT = 'join_input'    # 客户端输入IP
 STATE_CONNECTING = 'connecting'    # 客户端连接中
 DEFAULT_PORT = 8447
+
+# ===== 音效配置 =====
+SOUND_DIR = os.path.join(os.path.dirname(__file__), 'assets', 'sounds')
+
+# 强度 → 音调 (click_stereo)
+TAP_SOUNDS = {
+    1: 'click_stereo_x1.05.ogg',
+    2: 'click_stereo_x1.10.ogg',
+    3: 'click_stereo_x1.15.ogg',
+    4: 'click_stereo_x1.20.ogg',
+    5: 'click_stereo_x1.25.ogg',
+}
+
+# 切割：6 个变调全随机
+SHEAR_SOUNDS = [
+    'shear_x0.90.ogg', 'shear_x0.95.ogg', 'shear_x1.00.ogg',
+    'shear_x1.05.ogg', 'shear_x1.10.ogg', 'shear_x1.15.ogg',
+]
+
+# 点数包：按分值分段，每段 2 个随机
+ORB_SOUNDS = {
+    1: ['orb_x0.90.ogg', 'orb_x0.95.ogg'],
+    2: ['orb_x1.00.ogg', 'orb_x1.05.ogg'],
+    3: ['orb_x1.10.ogg', 'orb_x1.15.ogg'],
+}
+
+# 按钮：固定 x1.00
+CLICK_SOUND = 'click_stereo_x1.00.ogg'
 
 # ===== 字体配置 =====
 # 中文字体候选路径（按优先级排序，跨平台）
