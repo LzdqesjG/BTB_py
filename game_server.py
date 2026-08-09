@@ -159,11 +159,12 @@ class GameServer:
 
         # 音效
         from main import play_sfx
-        play_sfx('tap')
+        play_sfx('tap', strength=new_node.strength)
         if removed_ids or weakened:
             play_sfx('shear')
         if winner:
-            play_sfx('victory')
+            # 服务器处理蓝队动作：蓝队赢 → 红队（主机）输
+            play_sfx('heavy_hit')
 
         # 广播动作给客户端（与主机 _try_create_node 一致）
         self._send(proto.ACT_ADD_NODE, 'BLUE', new_node.x, new_node.y,

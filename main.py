@@ -12,38 +12,86 @@ pygame.init()
 # ===== 音效系统 =====
 SOUND_DIR = os.path.join(os.path.dirname(__file__), 'assets', 'sounds')
 
-SOUND_VARIANTS = {
-    'tap':   [f'click_stereo_x{p}.ogg' for p in ['1.05', '1.10', '1.15', '1.20', '1.25']],
-    'shear': [f'shear_x{p}.ogg' for p in ['0.90', '0.95', '1.05', '1.10', '1.15']],
-    'orb':   [f'orb_x{p}.ogg' for p in ['0.90', '0.95', '1.05', '1.10', '1.15']],
+# 强度 → 音调 (click_stereo)
+TAP_SOUNDS = {
+    1: 'click_stereo_x1.05.ogg',
+    2: 'click_stereo_x1.10.ogg',
+    3: 'click_stereo_x1.15.ogg',
+    4: 'click_stereo_x1.20.ogg',
+    5: 'click_stereo_x1.25.ogg',
 }
 
-_sfx_bank = {}  # {name: [Sound, ...]}
+# 切割：6 个变调全随机
+SHEAR_SOUNDS = [
+    'shear_x0.90.ogg', 'shear_x0.95.ogg', 'shear_x1.00.ogg',
+    'shear_x1.05.ogg', 'shear_x1.10.ogg', 'shear_x1.15.ogg',
+]
+
+# 点数包：按分值分段，每段 2 个随机
+ORB_SOUNDS = {
+    1: ['orb_x0.90.ogg', 'orb_x0.95.ogg'],
+    2: ['orb_x1.00.ogg', 'orb_x1.05.ogg'],
+    3: ['orb_x1.10.ogg', 'orb_x1.15.ogg'],
+}
+
+# 按钮：固定 x1.00
+CLICK_SOUND = 'click_stereo_x1.00.ogg'
+
+_sfx_bank = {}         # {filename: Sound}
+_sfx_debug_log = []    # 调试模式：[(filename, tick), ...]
+DEBUG_MODE = os.path.isfile(os.path.join(os.path.dirname(__file__), 'debug'))
 
 
 def _load_all_sfx():
-    for name, files in SOUND_VARIANTS.items():
-        sounds = []
+    for f in TAP_SOUNDS.values():
+        _load_one(f)
+    for f in SHEAR_SOUNDS:
+        _load_one(f)
+    for files in ORB_SOUNDS.values():
         for f in files:
-            path = os.path.join(SOUND_DIR, f)
-            try:
-                sounds.append(pygame.mixer.Sound(path))
-            except Exception as e:
-                print(f"[SFX] 加载失败: {path} - {e}")
-        if sounds:
-            _sfx_bank[name] = sounds
+            _load_one(f)
+    _load_one(CLICK_SOUND)
     for name in ['join_leave', 'victory', 'heavy_hit']:
-        path = os.path.join(SOUND_DIR, f'{name}.ogg')
-        try:
-            _sfx_bank[name] = [pygame.mixer.Sound(path)]
-        except Exception as e:
-            print(f"[SFX] 加载失败: {path} - {e}")
+        _load_one(f'{name}.ogg')
 
 
-def play_sfx(name):
-    """播放音效。name 不存在则静默忽略。"""
-    if name in _sfx_bank and _sfx_bank[name]:
-        random.choice(_sfx_bank[name]).play()
+def _load_one(filename):
+    path = os.path.join(SOUND_DIR, filename)
+    try:
+        _sfx_bank[filename] = pygame.mixer.Sound(path)
+    except Exception as e:
+        print(f"[SFX] 加载失败: {path} - {e}")
+
+
+def _play_file(fname):
+    snd = _sfx_bank.get(fname)
+    if snd:
+        snd.play()
+        if DEBUG_MODE:
+            _sfx_debug_log.append((fname, pygame.time.get_ticks()))
+
+
+def play_sfx(name, **kwargs):
+    """统一音效播放入口。
+    - tap:     kwargs['strength'] = 1~5 → 对应音调
+    - shear:   全随机 6 变调
+    - orb:     kwargs['value'] = 1~3 → 分段随机
+    - click:   固定 x1.00
+    - 其他:    单文件 (join_leave, victory, heavy_hit)
+    """
+    if name == 'tap':
+        strength = kwargs.get('strength', 1)
+        fname = TAP_SOUNDS.get(strength, TAP_SOUNDS[1])
+    elif name == 'shear':
+        fname = random.choice(SHEAR_SOUNDS)
+    elif name == 'orb':
+        value = kwargs.get('value', 1)
+        fname = random.choice(ORB_SOUNDS.get(value, ORB_SOUNDS[1]))
+    elif name == 'click':
+        fname = CLICK_SOUND
+    else:
+        fname = f'{name}.ogg'
+    _play_file(fname)
 
 
 _load_all_sfx()
@@ -379,7 +427,11 @@ class Game:
         elif cmd == proto.ACT_GAME_OVER:
             self.winner = params[0]
             self.state = STATE_GAME_OVER
-            play_sfx('victory')
+            # 按己方队伍播放胜利或失败音效
+            if self.my_team and self.my_team == self.winner:
+                play_sfx('victory')
+            else:
+                play_sfx('heavy_hit')
 
     def _node_by_id(self, node_id):
         for n in self.nodes:
@@ -475,7 +527,7 @@ class Game:
             self.points[node.team] += pack.value
             # 视觉反馈
             self.score_popups.append(ScorePopup(pack.x, pack.y, pack.value, node.team))
-            play_sfx('orb')
+            play_sfx('orb', value=pack.value)
             # 全图生成新点数包
             new_pack = self._spawn_pickup(half=None)
             self.pickups.append(new_pack)
@@ -680,7 +732,6 @@ class Game:
         if hit_root is not None:
             self.winner = attacker_team
             self.state = STATE_GAME_OVER
-            play_sfx('victory')
             return removed_ids, attacker_team, weakened
 
         # ===== 2. 检查穿过对方树枝（跨团队连线） =====
@@ -1109,10 +1160,13 @@ class Game:
             sys.exit()
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if hasattr(self, '_btn_single') and self._btn_single.collidepoint(event.pos):
+                play_sfx('click')
                 self.start_game()
             elif hasattr(self, '_btn_host') and self._btn_host.collidepoint(event.pos):
+                play_sfx('click')
                 self._start_host()
             elif hasattr(self, '_btn_join') and self._btn_join.collidepoint(event.pos):
+                play_sfx('click')
                 self.state = STATE_JOIN_INPUT
                 self.ip_input = ''
                 self.connect_error = None
@@ -1130,6 +1184,7 @@ class Game:
 
             # 开始游戏按钮（已连接时才有效）
             if hasattr(self, '_host_start_rect') and self._host_start_rect.collidepoint(event.pos):
+                play_sfx('click')
                 if self.net_server and self.net_server.connected:
                     self.start_host_game()
                 else:
@@ -1141,6 +1196,7 @@ class Game:
                     self.net_server.start()
             # 取消按钮
             if hasattr(self, '_host_cancel_rect') and self._host_cancel_rect.collidepoint(event.pos):
+                play_sfx('click')
                 if self.net_server:
                     self.net_server.stop()
                     self.net_server = None
@@ -1173,9 +1229,11 @@ class Game:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             # 快速填入
             if hasattr(self, '_quick_fill_rect') and self._quick_fill_rect.collidepoint(event.pos):
+                play_sfx('click')
                 self.ip_input = f'127.0.0.1:{DEFAULT_PORT}'
             # 返回按钮
             if hasattr(self, '_join_back_rect') and self._join_back_rect.collidepoint(event.pos):
+                play_sfx('click')
                 self.state = STATE_MENU
 
     def _handle_game_over_event(self, event):
@@ -1184,6 +1242,7 @@ class Game:
             sys.exit()
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if self.menu_btn_rect.collidepoint(event.pos):
+                play_sfx('click')
                 self.go_menu()
 
     def _handle_playing_event(self, event):
@@ -1206,6 +1265,7 @@ class Game:
             if event.button == 1:
                 # 先检查是否点结束回合
                 if self.end_turn_rect.collidepoint(mx, my):
+                    play_sfx('click')
                     self._end_turn()
                     return
                 # 本回合已创建过节点则不能再拖
@@ -1255,10 +1315,10 @@ class Game:
             # 拖动中：调节新节点强度
             if direction > 0 and self.temp_strength < MAX_STRENGTH:
                 self.temp_strength += 1
-                play_sfx('tap')
+                play_sfx('tap', strength=self.temp_strength)
             elif direction < 0 and self.temp_strength > MIN_STRENGTH:
                 self.temp_strength -= 1
-                play_sfx('tap')
+                play_sfx('tap', strength=self.temp_strength)
         elif self.hovered_branch_child is not None:
             child = self.hovered_branch_child
             if direction > 0:
@@ -1273,7 +1333,7 @@ class Game:
                             import network_protocol as proto
                             self._broadcast(proto.ACT_UPDATE_STRENGTH, child.id, child.strength)
                             self._broadcast_state_changed()
-                    play_sfx('tap')
+                    play_sfx('tap', strength=child.strength)
             elif direction < 0:
                 # 滚轮下 → 强度-1（最低1），返还1点
                 if child.strength > MIN_STRENGTH:
@@ -1286,7 +1346,7 @@ class Game:
                             import network_protocol as proto
                             self._broadcast(proto.ACT_UPDATE_STRENGTH, child.id, child.strength)
                             self._broadcast_state_changed()
-                    play_sfx('tap')
+                    play_sfx('tap', strength=child.strength)
 
     def _try_create_node(self, mx, my):
         node = self.drag_node
@@ -1332,7 +1392,7 @@ class Game:
         node.children.append(new_node)
         self.nodes.append(new_node)
         self.points[self.current_team] -= total
-        play_sfx('tap')
+        play_sfx('tap', strength=new_node.strength)
         # 结算：新树枝穿过对方树枝 → 扣强度 / 删除子树
         removed_ids, winner, weakened = self._resolve_crossing(new_node)
         if removed_ids or weakened:
@@ -1395,6 +1455,16 @@ class Game:
             self.draw_game_over(surface)
         else:
             self.draw_playing(surface)
+
+        # 调试模式：左下角显示最近播放的音效文件名
+        if DEBUG_MODE and _sfx_debug_log:
+            now = pygame.time.get_ticks()
+            _sfx_debug_log[:] = [(f, t) for f, t in _sfx_debug_log if now - t < 2000]
+            for i, (fname, _t) in enumerate(reversed(_sfx_debug_log)):
+                fnamee = fname.split('.')[0]
+                finaltext = f"[DEBUG] Sound #{i} - {fnamee}"
+                txt = font_tiny.render(finaltext, True, (random.randint(96, 255), random.randint(96, 255), random.randint(96, 255)))
+                surface.blit(txt, (10, SCREEN_HEIGHT - 20 - i * 16))
 
     def draw_host_wait(self, surface):
         """房主等待客户端加入界面。"""
@@ -1514,6 +1584,7 @@ class Game:
             sys.exit()
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if hasattr(self, '_client_wait_back_rect') and self._client_wait_back_rect.collidepoint(event.pos):
+                play_sfx('click')
                 self.go_menu()
 
 
