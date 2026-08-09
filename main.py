@@ -1594,6 +1594,12 @@ class Game:
             return
 
         self._ai_think_timer = 0
+
+        # 本回合已创建过节点 → 直接结束回合
+        if self.has_created_this_turn:
+            self._end_turn()
+            return
+
         from AI.aithink import AIThinker
         ai = AIThinker(self)
         action = ai.decide_action()
@@ -1639,7 +1645,53 @@ class Game:
                 play_sfx('shear')
             if winner:
                 play_sfx('victory' if self.my_team == winner else 'heavy_hit')
+
+            # 切割后自动降级：回收点数
+            if (not winner and strength >= 3
+                    and (removed_ids or weakened)):
+                own_root = None
+                for n in self.nodes:
+                    if n.team == self.current_team and n.parent is None:
+                        own_root = n
+                        break
+                is_defensive = (
+                    own_root
+                    and math.hypot(new_node.x - own_root.x,
+                                   new_node.y - own_root.y) <= 240)
+                target_strength = 2 if is_defensive else 1
+                if new_node.strength > target_strength:
+                    levels_down = new_node.strength - target_strength
+                    old_str = new_node.strength
+                    new_node.strength = target_strength
+                    self.points[self.current_team] += levels_down
+                    self.replay.record(
+                        'modify_branch', team=self.current_team,
+                        node_id=new_node.id,
+                        old_strength=old_str,
+                        new_strength=target_strength)
+                    if self.network_mode == 'host':
+                        import network_protocol as proto
+                        self._broadcast(proto.ACT_UPDATE_STRENGTH,
+                                        new_node.id, new_node.strength)
+                        self._broadcast_state_changed()
+                    play_sfx('tap', strength=target_strength)
+
             self.has_created_this_turn = True
+        elif action['type'] == 'modify_branch':
+            node = action['node']
+            new_str = action['new_strength']
+            if node.strength < MAX_STRENGTH and self.points[self.current_team] >= 1:
+                old_str = node.strength
+                node.strength = new_str
+                self.points[self.current_team] -= 1
+                self.replay.record('modify_branch', team=self.current_team,
+                                   node_id=node.id, old_strength=old_str,
+                                   new_strength=new_str)
+                if self.network_mode == 'host':
+                    import network_protocol as proto
+                    self._broadcast(proto.ACT_UPDATE_STRENGTH, node.id, node.strength)
+                    self._broadcast_state_changed()
+                play_sfx('tap', strength=new_str)
 
     def _end_turn(self):
         # 客户端模式：发送结束回合请求给服务器
@@ -1865,16 +1917,20 @@ class Game:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 self.state = STATE_MENU
-            elif event.key == pygame.K_UP:
+            elif event.key in (pygame.K_UP, pygame.K_DOWN):
                 if self._replay_files:
-                    self._replay_selected = max(0, self._replay_selected - 1)
-            elif event.key == pygame.K_DOWN:
-                if self._replay_files:
-                    self._replay_selected = min(len(self._replay_files) - 1, self._replay_selected + 1)
+                    n = len(self._replay_files)
+                    delta = -1 if event.key == pygame.K_UP else 1
+                    self._replay_selected = (self._replay_selected + delta) % n
             elif event.key == pygame.K_RETURN:
                 if self._replay_files:
                     play_sfx('click')
                     self._start_replay(self._replay_files[self._replay_selected])
+        if event.type == pygame.MOUSEWHEEL:
+            if self._replay_files:
+                n = len(self._replay_files)
+                delta = -1 if event.y > 0 else 1  # 上滚=上移=索引减
+                self._replay_selected = (self._replay_selected + delta) % n
 
     def _start_replay(self, filename):
         """加载回放文件，分组为步骤，构建初始棋盘。"""

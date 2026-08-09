@@ -1,0 +1,160 @@
+{
+    "_comment": "AI 参数配置文件。自动学习时修改此文件中的数值。",
+
+    "personality": {
+        "greediness": 0.65,
+        "_greediness_note": "攻击倾向 (0~1)，越高越激进推进",
+
+        "defensiveness": 0.55,
+        "_defensiveness_note": "防守意识 (0~1)，越高越重视拦截",
+
+        "randomness": 0.20,
+        "_randomness_note": "随机噪声幅度，越高越不可预测"
+    },
+
+    "scoring": {
+        "advance_weight": 40.0,
+        "_advance_weight_note": "进攻推进评分权重",
+
+        "defense_weight": 30.0,
+        "_defense_weight_note": "防守拦截评分权重",
+
+        "cut_weight": 25.0,
+        "_cut_weight_note": "切割敌方评分权重",
+
+        "pickup_weight": 8.0,
+        "_pickup_weight_note": "点数包引力评分权重",
+
+        "strength_per_level": 3.0,
+        "_strength_per_level_note": "每级强度额外加分",
+
+        "noise_range": 4.0,
+        "_noise_note": "评分随机噪声范围 (±)"
+    },
+
+    "cut_scoring": {
+        "enemy_strength_multiplier": 4.0,
+        "_enemy_strength_multiplier_note": "穿过敌方节点的基础分 = min(strength * 倍数, 上限)",
+
+        "enemy_strength_cap": 20.0,
+        "_enemy_strength_cap_note": "穿过敌方节点的单次分数上限",
+
+        "branch_cut_multiplier": 3.0,
+        "branch_cut_cap": 12.0,
+
+        "root_proximity_near": 240,
+        "_root_proximity_near_note": "敌方离己方根 ≤ 此距离时切割分 ×3",
+
+        "root_proximity_far": 400,
+        "_root_proximity_near_multiplier": 3.0,
+        "_root_proximity_far_note": "敌方离己方根 ≤ 此距离时切割分 ×1.5",
+        "_root_proximity_far_multiplier": 1.5,
+
+        "total_cap": 220.0
+    },
+
+    "defense_scoring": {
+        "line_range": 100,
+        "_line_range_note": "检查拦截路径的范围半径",
+
+        "max_value": 2.0,
+        "_max_value_note": "单节点防守分上限",
+
+        "check_limit": 5
+    },
+
+    "pickup_scoring": {
+        "range": 180,
+        "_range_note": "点数包引力计算范围"
+    },
+
+    "placement": {
+        "sample_distances": [100, 150, 190, 230],
+        "_sample_distances_note": "每个方向采样的距离档位",
+
+        "sample_angles": 8,
+        "_sample_angles_note": "每个节点采样的方向数",
+
+        "angle_jitter": 0.3,
+        "_angle_jitter_note": "角度随机扰动范围 (rad)",
+
+        "min_node_spacing": 3.5,
+        "_min_node_spacing_note": "新节点与已有节点的最小间隔 (×NODE_RADIUS)"
+    },
+
+    "range_upgrade": {
+        "unconditional_points": 3,
+        "_unconditional_points_note": "点数 ≥ 此值时无条件升级 range 0→1",
+
+        "chance_high": 0.55,
+        "_chance_high_note": "点数 ≥ 1 时升级概率",
+
+        "chance_low": 0.35,
+        "_chance_low_note": "点数 ≥ 2 时额外升级概率",
+
+        "points_for_chance_low": 2
+    },
+
+    "strength": {
+        "early_game_node_limit": 4,
+        "_early_game_node_limit_note": "己方节点 ≤ 此数时进入开局阶段",
+
+        "early_game_ceiling": 3,
+        "_early_game_ceiling_note": "开局阶段最高强度",
+
+        "high_point_weights": [1, 2, 5, 6, 4]
+    },
+
+    "branch_modify": {
+        "chance": 0.30,
+        "_chance_note": "每回合调节树枝的概率",
+
+        "enemy_proximity_range": 500,
+        "enemy_proximity_score": 8.0,
+
+        "strength_diff_score": 3.0,
+
+        "own_distance_range": 1200,
+        "own_distance_score": 5.0,
+
+        "threshold": 3.0
+    },
+
+    "force_pickup": {
+        "range": 160,
+        "_range_note": "点数包在此范围内强制拾取",
+
+        "strength": 1
+    },
+
+    "force_cut_nearby": {
+        "range": 120,
+        "_range_note": "敌方节点在此范围内主动切割",
+
+        "extend_ratio": 2.0,
+        "_extend_ratio_note": "落点在敌方后方的延伸距离 (×NODE_RADIUS)",
+
+        "min_strength": 2
+    },
+
+    "force_defend_zone": {
+        "red": { "x_max": 500, "y_max": 300 },
+        "blue": { "x_min": 800, "y_min": 400 },
+        "_zone_note": "红方警戒区 x<500,y<300；蓝方警戒区 x>800,y>400",
+
+        "offset_ratio": 0.35,
+        "_offset_ratio_note": "拦截点位置：从敌方沿敌→根方向偏移的比例",
+
+        "min_strength": 3
+    },
+
+    "force_defend_root": {
+        "range": 240,
+        "_range_note": "敌方离己方根在此范围内强制防御",
+
+        "extend_ratio": 2.0,
+        "_extend_ratio_note": "落点在敌方后方的延伸距离 (×NODE_RADIUS)",
+
+        "min_strength": 3
+    }
+}

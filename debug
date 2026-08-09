@@ -3,5 +3,4 @@
 # SOUNDS_DISABLED  -  不播放游戏音效
 # SHOW_DEBUG_INFO  -  在左下角显示调试信息
 
-SOUNDS_DISABLED
 SHOW_DEBUG_INFO
