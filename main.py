@@ -15,6 +15,14 @@ pygame.init()
 _sfx_bank = {}         # {filename: Sound}
 _sfx_debug_log = []    # 调试模式：[(filename, tick), ...]
 DEBUG_MODE = os.path.isfile(os.path.join(os.path.dirname(__file__), 'debug'))
+DEBUGS = []
+with open('debug', 'r', encoding='utf-8') as f:
+    debug_mode = f.read().splitlines()
+    for line in debug_mode:
+        line = line.strip()
+        if line and not line.startswith('#'):
+            DEBUGS.append(line)
+print("[DEBUG] 已激活的调试选项: " + ", ".join(DEBUGS))
 
 
 def _load_all_sfx():
@@ -54,6 +62,8 @@ def play_sfx(name, **kwargs):
     - click:   固定 x1.00
     - 其他:    单文件 (join_leave, victory, heavy_hit)
     """
+    if "SOUNDS_DISABLED" in DEBUGS:
+        return
     if name == 'tap':
         strength = kwargs.get('strength', 1)
         fname = TAP_SOUNDS.get(strength, TAP_SOUNDS[1])
@@ -578,6 +588,16 @@ class Game:
 
         if self.state == STATE_GAME_OVER:
             self.replay.save()
+            return
+
+        if self.state == STATE_REPLAY_PLAY:
+            if self._replay_playing:
+                self._replay_timer += 1
+                if self._replay_timer >= 60:
+                    self._replay_timer = 0
+                    self._replay_step_forward()
+                    if self._is_replay_last_step():
+                        self._replay_playing = False
             return
 
         if self.state != STATE_PLAYING:
@@ -1670,7 +1690,7 @@ class Game:
             self.draw_playing(surface)
 
         # 调试模式：左下角显示最近播放的音效文件名
-        if DEBUG_MODE and _sfx_debug_log:
+        if DEBUG_MODE and _sfx_debug_log and 'SHOW_DEBUG_INFO' in DEBUGS:
             now = pygame.time.get_ticks()
             _sfx_debug_log[:] = [(f, t) for f, t in _sfx_debug_log if now - t < 2000]
             for i, (fname, _t) in enumerate(reversed(_sfx_debug_log)):
@@ -1857,14 +1877,137 @@ class Game:
                     self._start_replay(self._replay_files[self._replay_selected])
 
     def _start_replay(self, filename):
-        """开始回放（预留）。"""
-        self.reset()
+        """加载回放文件，分组为步骤，构建初始棋盘。"""
+        import json
+        filepath = os.path.join(os.path.dirname(__file__), 'replays', filename)
+        with open(filepath, 'r', encoding='utf-8') as f:
+            all_actions = [json.loads(line) for line in f if line.strip()]
+
+        # 按 end_turn 分步
+        self._replay_steps = []
+        current = []
+        for a in all_actions:
+            current.append(a)
+            if a['type'] == 'end_turn':
+                self._replay_steps.append(current)
+                current = []
+        if current:  # 尾部残余（如 game_over）
+            self._replay_steps.append(current)
+
+        self._replay_step_index = -1
+        self._replay_playing = False
+        self._replay_timer = 0
+
+        # 构建初始状态（只有根节点，无任何操作）
+        Node._next_id = 100000
+        self.nodes = []
+        self.points = {'RED': INITIAL_POINTS, 'BLUE': INITIAL_POINTS}
+        red_root = Node('RED', 120, 120, strength=1)
+        red_root.id = 0
+        blue_root = Node('BLUE', SCREEN_WIDTH - 120, SCREEN_HEIGHT - 120, strength=1)
+        blue_root.id = 1
+        self.nodes = [red_root, blue_root]
+        self.pickups = []
+        self.winner = None
+        self.current_team = 'RED'
+        self.turn_count = 1
+        self.dragging = False
+        self.drag_node = None
+        self.has_created_this_turn = False
+        self.hovered_branch_child = None
+
+        self._replay_id_map = {0: red_root, 1: blue_root}
         self.state = STATE_REPLAY_PLAY
 
+    def _rebuild_replay_state(self):
+        """从零重建游戏状态，应用到当前步骤。"""
+        Node._next_id = 100000
+        self.nodes = []
+        self.points = {'RED': INITIAL_POINTS, 'BLUE': INITIAL_POINTS}
+        red_root = Node('RED', 120, 120, strength=1)
+        red_root.id = 0
+        blue_root = Node('BLUE', SCREEN_WIDTH - 120, SCREEN_HEIGHT - 120, strength=1)
+        blue_root.id = 1
+        self.nodes = [red_root, blue_root]
+        self.pickups = []
+        self.winner = None
+        self.current_team = 'RED'
+        self.turn_count = 1
+        self._replay_id_map = {0: red_root, 1: blue_root}
+
+        for step_idx in range(self._replay_step_index + 1):
+            for action in self._replay_steps[step_idx]:
+                self._apply_replay_action(action)
+
+    def _apply_replay_action(self, action):
+        """应用单条回放动作到当前游戏状态。"""
+        t = action['type']
+        if t == 'init':
+            self.points['RED'] = action['red_points']
+            self.points['BLUE'] = action['blue_points']
+        elif t == 'spawn_pack':
+            self.pickups.append(PointPack(action['x'], action['y'], action['value']))
+        elif t == 'place_node':
+            parent = self._replay_id_map[action['parent_id']]
+            new_node = Node(action['team'], action['x'], action['y'],
+                            action['strength'], parent=parent)
+            new_node.id = action['node_id']
+            self._replay_id_map[action['node_id']] = new_node
+            parent.children.append(new_node)
+            self.nodes.append(new_node)
+        elif t == 'modify_branch':
+            node = self._replay_id_map[action['node_id']]
+            node.strength = action['new_strength']
+        elif t == 'remove_nodes':
+            ids_to_remove = set(action['ids'])
+            for n in self.nodes:
+                n.children = [c for c in n.children if c.id not in ids_to_remove]
+            self.nodes = [n for n in self.nodes if n.id not in ids_to_remove]
+        elif t == 'weaken_node':
+            node = self._replay_id_map[action['node_id']]
+            node.strength = action['new_strength']
+        elif t == 'pickup':
+            for p in list(self.pickups):
+                if abs(p.x - action['x']) < 1 and abs(p.y - action['y']) < 1:
+                    self.pickups.remove(p)
+                    break
+            self.points[action['team']] += action['value']
+        elif t == 'end_turn':
+            if self.current_team == 'RED':
+                self.current_team = 'BLUE'
+            else:
+                self.current_team = 'RED'
+                self.turn_count += 1
+        elif t == 'game_over':
+            self.winner = action['winner']
+
+    def _replay_step_forward(self):
+        """前进一步。"""
+        if self._replay_step_index + 1 >= len(self._replay_steps):
+            return False
+        self._replay_step_index += 1
+        for action in self._replay_steps[self._replay_step_index]:
+            self._apply_replay_action(action)
+        return True
+
+    def _replay_step_back(self):
+        """后退一步。"""
+        if self._replay_step_index < 0:
+            return False
+        self._replay_step_index -= 1
+        self._rebuild_replay_state()
+        return True
+
+    def _is_replay_last_step(self):
+        return self._replay_step_index >= len(self._replay_steps) - 1
+
+    def _is_replay_first_step(self):
+        return self._replay_step_index < 0
+
     def draw_replay_play(self, surface):
-        """回放播放界面（预留，空对局）。"""
+        """回放播放界面。"""
         surface.fill(BG_COLOR)
-        # 显示两个根节点
+        # 画连接线和节点
         for node in self.nodes:
             if node.parent is not None:
                 p = node.parent
@@ -1873,13 +2016,56 @@ class Game:
                 pygame.draw.line(surface, color, (int(p.x), int(p.y)),
                                  (int(node.x), int(node.y)), width)
             node.draw(surface)
-        # 顶部信息
-        hud = pygame.Rect((SCREEN_WIDTH - 300) // 2, 8, 300, 36)
+        # 画点数包
+        for pack in self.pickups:
+            pack.draw(surface)
+
+        # 顶部信息栏
+        hud = pygame.Rect((SCREEN_WIDTH - 360) // 2, 8, 360, 36)
         pygame.draw.rect(surface, PANEL_COLOR, hud, border_radius=6)
-        txt = font_mid.render("回放模式 - 开发中", True, GRAY)
+        total_steps = len(self._replay_steps)
+        step_label = f"回放模式  步骤 {self._replay_step_index + 1}/{total_steps}"
+        txt = font_mid.render(step_label, True, WHITE)
         surface.blit(txt, txt.get_rect(center=hud.center))
-        # 返回按钮
+
+        # 胜利提示
+        if self.winner:
+            wcolor = TEAM_COLORS[self.winner]['main']
+            wtxt = font_mid.render(f"{TEAM_COLORS[self.winner]['name']} 获胜", True, wcolor)
+            surface.blit(wtxt, wtxt.get_rect(center=(SCREEN_WIDTH // 2, 55)))
+
+        # 控制按钮（顶部信息栏下方）
         mouse_pos = pygame.mouse.get_pos()
+        btn_w, btn_h = 90, 30
+        btn_y = hud.bottom + 8
+        total_w = btn_w * 3 + 12 * 2
+        start_x = SCREEN_WIDTH // 2 - total_w // 2
+
+        def _draw_btn(x, label, enabled, hover_color):
+            rect = pygame.Rect(x, btn_y, btn_w, btn_h)
+            h = rect.collidepoint(mouse_pos) and enabled
+            c = hover_color if h else ((120, 120, 120) if not enabled else (60, 60, 80))
+            pygame.draw.rect(surface, c, rect, border_radius=5)
+            pygame.draw.rect(surface, WHITE, rect, 1, border_radius=5)
+            tc = WHITE if enabled else DARK_GRAY
+            t = font_small.render(label, True, tc)
+            surface.blit(t, t.get_rect(center=rect.center))
+            return rect
+
+        bx1 = start_x
+        self._replay_prev_rect = _draw_btn(bx1, "上一步",
+                                           not self._is_replay_first_step(),
+                                           (50, 80, 150))
+        bx2 = bx1 + btn_w + 12
+        play_label = "暂停" if self._replay_playing else "播放"
+        self._replay_play_rect = _draw_btn(bx2, play_label, True,
+                                           (180, 140, 40) if self._replay_playing else (50, 160, 50))
+        bx3 = bx2 + btn_w + 12
+        self._replay_next_rect = _draw_btn(bx3, "下一步",
+                                           not self._is_replay_last_step(),
+                                           (50, 80, 150))
+
+        # 返回按钮
         back_rect = pygame.Rect(SCREEN_WIDTH - 120, SCREEN_HEIGHT - 50, 100, 34)
         h = back_rect.collidepoint(mouse_pos)
         pygame.draw.rect(surface, GREEN if h else (40, 140, 40), back_rect, border_radius=6)
@@ -1894,11 +2080,34 @@ class Game:
             pygame.quit()
             sys.exit()
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if hasattr(self, '_replay_back_rect') and self._replay_back_rect.collidepoint(event.pos):
+            mp = event.pos
+            if hasattr(self, '_replay_back_rect') and self._replay_back_rect.collidepoint(mp):
                 play_sfx('click')
                 self.go_menu()
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self.go_menu()
+            elif hasattr(self, '_replay_play_rect') and self._replay_play_rect.collidepoint(mp):
+                play_sfx('click')
+                self._replay_playing = not self._replay_playing
+                self._replay_timer = 0
+            elif hasattr(self, '_replay_prev_rect') and self._replay_prev_rect.collidepoint(mp):
+                if not self._is_replay_first_step():
+                    play_sfx('click')
+                    self._replay_step_back()
+            elif hasattr(self, '_replay_next_rect') and self._replay_next_rect.collidepoint(mp):
+                if not self._is_replay_last_step():
+                    play_sfx('click')
+                    self._replay_step_forward()
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.go_menu()
+            elif event.key == pygame.K_LEFT:
+                if not self._is_replay_first_step():
+                    self._replay_step_back()
+            elif event.key == pygame.K_RIGHT:
+                if not self._is_replay_last_step():
+                    self._replay_step_forward()
+            elif event.key == pygame.K_SPACE:
+                self._replay_playing = not self._replay_playing
+                self._replay_timer = 0
 
 
 def main():
