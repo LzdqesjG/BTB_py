@@ -1,0 +1,14 @@
+# venv
+.venv/
+
+# Py cache
+__pycache__/
+
+# Packages
+Packages/
+
+# Log files
+*.log
+
+# Test files
+tests/
