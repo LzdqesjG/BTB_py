@@ -1168,6 +1168,11 @@ class Game:
         # 滚轮事件 (pygame 2 / SDL2): pygame.MOUSEWHEEL
         if event.type == pygame.MOUSEWHEEL:
             self._handle_wheel(1 if event.y > 0 else -1)
+        # 方向键调节强度（无滚轮设备备选）
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
+            self._handle_wheel(1)
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
+            self._handle_wheel(-1)
 
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             if self.dragging and self.drag_node is not None:

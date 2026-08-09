@@ -63,12 +63,30 @@ FONT_CANDIDATES = [
     r"C:\Windows\Fonts\simsun.ttc",    # 宋体
     r"C:\Windows\Fonts\simkai.ttf",    # 楷体
     r"C:\Windows\Fonts\simli.ttf",     # 隶书
+    # macOS
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    # Linux
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+    # Android (Termux)
+    "/system/fonts/NotoSansCJK-Regular.ttc",
+    "/system/fonts/DroidSansFallback.ttf",
+    "/system/fonts/NotoSansSC-Regular.otf",
+    "/system/fonts/NotoSansTC-Regular.otf",
+    "/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans.ttf",
 ]
 
 # 粗体优先候选（会插在列表最前面）
 FONT_BOLD_CANDIDATES = [
     r"C:\Windows\Fonts\msyhbd.ttc",
     r"C:\Windows\Fonts\simhei.ttf",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/system/fonts/NotoSansCJK-Bold.ttc",
+    "/system/fonts/DroidSansFallback-Bold.ttf",
 ]
 
 
