@@ -2,11 +2,52 @@ import pygame
 import pygame.gfxdraw
 import math
 import sys
+import os
 import random
 
 from constant import *
 
 pygame.init()
+
+# ===== 音效系统 =====
+SOUND_DIR = os.path.join(os.path.dirname(__file__), 'assets', 'sounds')
+
+SOUND_VARIANTS = {
+    'tap':   [f'click_stereo_x{p}.ogg' for p in ['1.05', '1.10', '1.15', '1.20', '1.25']],
+    'shear': [f'shear_x{p}.ogg' for p in ['0.90', '0.95', '1.05', '1.10', '1.15']],
+    'orb':   [f'orb_x{p}.ogg' for p in ['0.90', '0.95', '1.05', '1.10', '1.15']],
+}
+
+_sfx_bank = {}  # {name: [Sound, ...]}
+
+
+def _load_all_sfx():
+    for name, files in SOUND_VARIANTS.items():
+        sounds = []
+        for f in files:
+            path = os.path.join(SOUND_DIR, f)
+            try:
+                sounds.append(pygame.mixer.Sound(path))
+            except Exception as e:
+                print(f"[SFX] 加载失败: {path} - {e}")
+        if sounds:
+            _sfx_bank[name] = sounds
+    for name in ['join_leave', 'victory', 'heavy_hit']:
+        path = os.path.join(SOUND_DIR, f'{name}.ogg')
+        try:
+            _sfx_bank[name] = [pygame.mixer.Sound(path)]
+        except Exception as e:
+            print(f"[SFX] 加载失败: {path} - {e}")
+
+
+def play_sfx(name):
+    """播放音效。name 不存在则静默忽略。"""
+    if name in _sfx_bank and _sfx_bank[name]:
+        random.choice(_sfx_bank[name]).play()
+
+
+_load_all_sfx()
+# ===== 音效系统 END =====
 
 
 font_big = get_font(36, bold=True)
@@ -215,6 +256,9 @@ class Game:
         self.connect_error = None  # 连接错误信息
         self.host_port = DEFAULT_PORT
 
+        # 联机状态追踪（用于进出提示音）
+        self._last_remote_connected = False
+
     def reset(self):
         Node._next_id = 0
         self.nodes = []
@@ -316,6 +360,7 @@ class Game:
                 self.drag_node = None
             if self.hovered_branch_child is not None and self.hovered_branch_child.id in ids_to_remove:
                 self.hovered_branch_child = None
+            play_sfx('shear')
         elif cmd == proto.ACT_UPDATE_STRENGTH:
             node_id = int(params[0])
             new_strength = int(params[1])
@@ -334,6 +379,7 @@ class Game:
         elif cmd == proto.ACT_GAME_OVER:
             self.winner = params[0]
             self.state = STATE_GAME_OVER
+            play_sfx('victory')
 
     def _node_by_id(self, node_id):
         for n in self.nodes:
@@ -429,6 +475,7 @@ class Game:
             self.points[node.team] += pack.value
             # 视觉反馈
             self.score_popups.append(ScorePopup(pack.x, pack.y, pack.value, node.team))
+            play_sfx('orb')
             # 全图生成新点数包
             new_pack = self._spawn_pickup(half=None)
             self.pickups.append(new_pack)
@@ -440,7 +487,16 @@ class Game:
             self.net_server.process_actions()
         elif self.network_mode == 'client' and self.net_client:
             self.net_client.process_updates()
-            # 断线检测
+
+        # 联机进出提示音（所有状态生效）
+        remote_now = False
+        if self.network_mode == 'host' and self.net_server:
+            remote_now = self.net_server.connected
+        elif self.network_mode == 'client' and self.net_client:
+            remote_now = self.net_client.connected
+        if remote_now != self._last_remote_connected:
+            play_sfx('join_leave')
+            self._last_remote_connected = remote_now
 
         # 客户端等待状态：检查是否收到 playing 状态
         if self.state == STATE_CLIENT_WAIT:
@@ -624,6 +680,7 @@ class Game:
         if hit_root is not None:
             self.winner = attacker_team
             self.state = STATE_GAME_OVER
+            play_sfx('victory')
             return removed_ids, attacker_team, weakened
 
         # ===== 2. 检查穿过对方树枝（跨团队连线） =====
@@ -1198,8 +1255,10 @@ class Game:
             # 拖动中：调节新节点强度
             if direction > 0 and self.temp_strength < MAX_STRENGTH:
                 self.temp_strength += 1
+                play_sfx('tap')
             elif direction < 0 and self.temp_strength > MIN_STRENGTH:
                 self.temp_strength -= 1
+                play_sfx('tap')
         elif self.hovered_branch_child is not None:
             child = self.hovered_branch_child
             if direction > 0:
@@ -1214,6 +1273,7 @@ class Game:
                             import network_protocol as proto
                             self._broadcast(proto.ACT_UPDATE_STRENGTH, child.id, child.strength)
                             self._broadcast_state_changed()
+                    play_sfx('tap')
             elif direction < 0:
                 # 滚轮下 → 强度-1（最低1），返还1点
                 if child.strength > MIN_STRENGTH:
@@ -1226,6 +1286,7 @@ class Game:
                             import network_protocol as proto
                             self._broadcast(proto.ACT_UPDATE_STRENGTH, child.id, child.strength)
                             self._broadcast_state_changed()
+                    play_sfx('tap')
 
     def _try_create_node(self, mx, my):
         node = self.drag_node
@@ -1271,8 +1332,13 @@ class Game:
         node.children.append(new_node)
         self.nodes.append(new_node)
         self.points[self.current_team] -= total
+        play_sfx('tap')
         # 结算：新树枝穿过对方树枝 → 扣强度 / 删除子树
         removed_ids, winner, weakened = self._resolve_crossing(new_node)
+        if removed_ids or weakened:
+            play_sfx('shear')
+        if winner:
+            play_sfx('victory')
         # 一回合只能创建一个节点，但不自动结束回合
         self.has_created_this_turn = True
 

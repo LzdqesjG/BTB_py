@@ -157,6 +157,14 @@ class GameServer:
         removed_ids, winner, weakened = game._resolve_crossing(new_node)
         game.has_created_this_turn = True
 
+        # 音效
+        from main import play_sfx
+        play_sfx('tap')
+        if removed_ids or weakened:
+            play_sfx('shear')
+        if winner:
+            play_sfx('victory')
+
         # 广播动作给客户端（与主机 _try_create_node 一致）
         self._send(proto.ACT_ADD_NODE, 'BLUE', new_node.x, new_node.y,
                    new_node.strength, new_node.parent.id, new_node.id)
