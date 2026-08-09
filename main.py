@@ -307,6 +307,11 @@ class Game:
         # 联机状态追踪（用于进出提示音）
         self._last_remote_connected = False
 
+        # AI 模式
+        self._ai_mode = False
+        self._ai_team = None          # AI 控制的队伍
+        self._ai_think_timer = 0
+
     def reset(self):
         Node._next_id = 0
         self.nodes = []
@@ -351,6 +356,16 @@ class Game:
         self.my_team = 'BLUE'
         self.state = STATE_CLIENT_WAIT
 
+    def start_ai_game(self):
+        """AI对战模式：随机分配队伍，本地对局。"""
+        self._ai_mode = True
+        self._ai_team = random.choice(['RED', 'BLUE'])
+        self.my_team = 'RED' if self._ai_team == 'BLUE' else 'BLUE'
+        self.network_mode = None
+        self._ai_think_timer = 0
+        self.reset()
+        self.state = STATE_PLAYING
+
     def go_menu(self):
         """返回菜单，清理网络资源。"""
         if self.net_server:
@@ -361,6 +376,8 @@ class Game:
             self.net_client = None
         self.network_mode = None
         self.my_team = None
+        self._ai_mode = False
+        self._ai_team = None
         self.ip_input = ''
         self.connect_error = None
         self.state = STATE_MENU
@@ -579,6 +596,10 @@ class Game:
                 self._broadcast_state_changed()
         self._update_hovered_branch()
         self.score_popups = [p for p in self.score_popups if p.is_alive()]
+
+        # AI 模式：AI 回合自动操作
+        if self._ai_mode and self.current_team == self._ai_team:
+            self._ai_update()
 
         # 房主：游戏结束时通知客户端
         if self.network_mode == 'host' and self.state == STATE_GAME_OVER and self.winner:
@@ -847,6 +868,12 @@ class Game:
             y2 = center[1] + radius * math.sin(a2)
             pygame.draw.line(surface, color, (x1, y1), (x2, y2), width)
 
+    def _team_label(self, team):
+        """返回队伍在 UI 上的显示名称。AI 模式下显示 你/AI。"""
+        if self._ai_mode:
+            return '你' if team == self.my_team else 'AI'
+        return TEAM_COLORS[team]['name']
+
     # ===== 菜单绘制 =====
     def draw_menu(self, surface):
         surface.fill(BG_COLOR)
@@ -885,37 +912,53 @@ class Game:
             txt = font_small.render(line, True, WHITE if (i <= 3 or highlight) else GRAY)
             surface.blit(txt, (150, 225 + i * 21))
 
-        # 三个按钮：单人对战 / 创建房间 / 加入房间
+        # 四个按钮：单人 / AI对战 / 创建房间 / 加入房间
         mouse_pos = pygame.mouse.get_pos()
         btn_y = 545
-        btn_w, btn_h = 200, 46
+        btn_w, btn_h = 170, 46
+        gap = 10
+        total_w = btn_w * 4 + gap * 3
+        start_x = SCREEN_WIDTH // 2 - total_w // 2
 
         # 单人对战
-        btn1 = pygame.Rect(SCREEN_WIDTH // 2 - 320, btn_y, btn_w, btn_h)
+        bx1 = start_x
+        btn1 = pygame.Rect(bx1, btn_y, btn_w, btn_h)
         h1 = btn1.collidepoint(mouse_pos)
         pygame.draw.rect(surface, GREEN if h1 else (40, 140, 40), btn1, border_radius=8)
         pygame.draw.rect(surface, WHITE, btn1, 2, border_radius=8)
-        surface.blit(font_mid.render("开始游戏 (单人)", True, WHITE),
-                     font_mid.render("开始游戏 (单人)", True, WHITE).get_rect(center=btn1.center))
+        surface.blit(font_mid.render("单人", True, WHITE),
+                     font_mid.render("单人", True, WHITE).get_rect(center=btn1.center))
         self._btn_single = btn1
 
-        # 创建房间
-        btn2 = pygame.Rect(SCREEN_WIDTH // 2 - 100, btn_y, btn_w, btn_h)
+        # AI 对战
+        bx2 = bx1 + btn_w + gap
+        btn2 = pygame.Rect(bx2, btn_y, btn_w, btn_h)
         h2 = btn2.collidepoint(mouse_pos)
-        pygame.draw.rect(surface, (180, 50, 50) if h2 else (120, 30, 30), btn2, border_radius=8)
+        pygame.draw.rect(surface, (200, 160, 40) if h2 else (140, 110, 30), btn2, border_radius=8)
         pygame.draw.rect(surface, WHITE, btn2, 2, border_radius=8)
-        surface.blit(font_mid.render("创建房间 (红队)", True, WHITE),
-                     font_mid.render("创建房间 (红队)", True, WHITE).get_rect(center=btn2.center))
-        self._btn_host = btn2
+        surface.blit(font_mid.render("AI 对战", True, WHITE),
+                     font_mid.render("AI 对战", True, WHITE).get_rect(center=btn2.center))
+        self._btn_ai = btn2
+
+        # 创建房间
+        bx3 = bx2 + btn_w + gap
+        btn3 = pygame.Rect(bx3, btn_y, btn_w, btn_h)
+        h3 = btn3.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, (180, 50, 50) if h3 else (120, 30, 30), btn3, border_radius=8)
+        pygame.draw.rect(surface, WHITE, btn3, 2, border_radius=8)
+        surface.blit(font_mid.render("创建房间", True, WHITE),
+                     font_mid.render("创建房间", True, WHITE).get_rect(center=btn3.center))
+        self._btn_host = btn3
 
         # 加入房间
-        btn3 = pygame.Rect(SCREEN_WIDTH // 2 + 120, btn_y, btn_w, btn_h)
-        h3 = btn3.collidepoint(mouse_pos)
-        pygame.draw.rect(surface, (50, 80, 200) if h3 else (30, 50, 140), btn3, border_radius=8)
-        pygame.draw.rect(surface, WHITE, btn3, 2, border_radius=8)
-        surface.blit(font_mid.render("加入房间 (蓝队)", True, WHITE),
-                     font_mid.render("加入房间 (蓝队)", True, WHITE).get_rect(center=btn3.center))
-        self._btn_join = btn3
+        bx4 = bx3 + btn_w + gap
+        btn4 = pygame.Rect(bx4, btn_y, btn_w, btn_h)
+        h4 = btn4.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, (50, 80, 200) if h4 else (30, 50, 140), btn4, border_radius=8)
+        pygame.draw.rect(surface, WHITE, btn4, 2, border_radius=8)
+        surface.blit(font_mid.render("加入房间", True, WHITE),
+                     font_mid.render("加入房间", True, WHITE).get_rect(center=btn4.center))
+        self._btn_join = btn4
 
     # ===== 游戏结束绘制 =====
     def draw_game_over(self, surface):
@@ -925,7 +968,7 @@ class Game:
 
         winner = self.winner or 'RED'
         color = TEAM_COLORS[winner]['main']
-        name = TEAM_COLORS[winner]['name']
+        name = self._team_label(winner)
 
         title = font_big.render(f"{name} 获胜！", True, color)
         surface.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 160)))
@@ -1030,7 +1073,8 @@ class Game:
         hud_red = pygame.Rect(10, 8, 180, 62)
         pygame.draw.rect(surface, PANEL_COLOR, hud_red, border_radius=6)
         pygame.draw.rect(surface, RED, hud_red, 2, border_radius=6)
-        rt = font_mid.render("红方 (左上)", True, LIGHT_RED)
+        red_label = self._team_label('RED')
+        rt = font_mid.render(f"{red_label} (红方)", True, LIGHT_RED)
         surface.blit(rt, (hud_red.x + 10, hud_red.y + 6))
         rp = font_small.render(f"点数: {self.points['RED']}", True, WHITE)
         surface.blit(rp, (hud_red.x + 10, hud_red.y + 32))
@@ -1041,7 +1085,8 @@ class Game:
         hud_blue = pygame.Rect(SCREEN_WIDTH - 190, 8, 180, 62)
         pygame.draw.rect(surface, PANEL_COLOR, hud_blue, border_radius=6)
         pygame.draw.rect(surface, BLUE, hud_blue, 2, border_radius=6)
-        bt = font_mid.render("蓝方 (右下)", True, LIGHT_BLUE)
+        blue_label = self._team_label('BLUE')
+        bt = font_mid.render(f"{blue_label} (蓝方)", True, LIGHT_BLUE)
         surface.blit(bt, (hud_blue.x + 10, hud_blue.y + 6))
         bp = font_small.render(f"点数: {self.points['BLUE']}", True, WHITE)
         surface.blit(bp, (hud_blue.x + 10, hud_blue.y + 32))
@@ -1049,7 +1094,7 @@ class Game:
         surface.blit(bc, (hud_blue.x + 100, hud_blue.y + 32))
 
         # 中间回合信息
-        turn_name = TEAM_COLORS[self.current_team]['name']
+        turn_name = self._team_label(self.current_team)
         turn_color = TEAM_COLORS[self.current_team]['main']
         turn_rect_w = 220
         hud_turn = pygame.Rect((SCREEN_WIDTH - turn_rect_w) // 2, 8, turn_rect_w, 62)
@@ -1091,7 +1136,9 @@ class Game:
         surface.blit(et, et.get_rect(center=self.end_turn_rect.center))
 
         # 底部提示
-        if self.network_mode and self.current_team != self.my_team:
+        if self._ai_mode and self.current_team == self._ai_team:
+            hint = font_tiny.render("AI 思考中...", True, (200, 160, 60))
+        elif self.network_mode and self.current_team != self.my_team:
             hint = font_tiny.render("等待对方操作...", True, (200, 200, 100))
         elif self.dragging:
             hint = font_tiny.render("滚轮调强度 | 空格切范围 | 松开鼠标创建节点", True, DARK_GRAY)
@@ -1121,6 +1168,7 @@ class Game:
     def _start_host(self):
         """启动房主服务器，进入等待状态。"""
         from game_server import GameServer
+        self.network_mode = 'host'
         self.net_server = GameServer(self, self.host_port)
         self.net_server.start()
         self.state = STATE_HOST_WAIT
@@ -1162,6 +1210,9 @@ class Game:
             if hasattr(self, '_btn_single') and self._btn_single.collidepoint(event.pos):
                 play_sfx('click')
                 self.start_game()
+            elif hasattr(self, '_btn_ai') and self._btn_ai.collidepoint(event.pos):
+                play_sfx('click')
+                self.start_ai_game()
             elif hasattr(self, '_btn_host') and self._btn_host.collidepoint(event.pos):
                 play_sfx('click')
                 self._start_host()
@@ -1250,8 +1301,11 @@ class Game:
             pygame.quit()
             sys.exit()
 
-        # 网络模式：非己方回合时只允许鼠标移动和Tab（结束回合在己方回合才有意义）
-        is_my_turn = (self.network_mode is None or self.current_team == self.my_team)
+        # 网络模式/AI模式：非己方回合时只允许鼠标移动
+        if self._ai_mode:
+            is_my_turn = (self.current_team != self._ai_team)
+        else:
+            is_my_turn = (self.network_mode is None or self.current_team == self.my_team)
 
         if event.type == pygame.MOUSEMOTION:
             self.mouse_x, self.mouse_y = event.pos
@@ -1398,7 +1452,10 @@ class Game:
         if removed_ids or weakened:
             play_sfx('shear')
         if winner:
-            play_sfx('victory')
+            if self.my_team:
+                play_sfx('victory' if self.my_team == winner else 'heavy_hit')
+            else:
+                play_sfx('victory')
         # 一回合只能创建一个节点，但不自动结束回合
         self.has_created_this_turn = True
 
@@ -1416,6 +1473,48 @@ class Game:
                 self._broadcast(proto.ACT_UPDATE_STRENGTH, nid, new_str)
             # 3. 同步回合/点数/点数包
             self._broadcast_state_changed()
+
+    def _ai_update(self):
+        """AI 回合自动操作。每帧调用，延迟后执行 AI 动作。"""
+        AI_THINK_DELAY = 90  # ~1.5 秒思考时间
+        if self._ai_think_timer < AI_THINK_DELAY:
+            self._ai_think_timer += 1
+            return
+
+        self._ai_think_timer = 0
+        from AI.aithink import AIThinker
+        ai = AIThinker(self)
+        action = ai.decide_action()
+
+        if action is None:
+            return
+
+        if action['type'] == 'end_turn':
+            self._end_turn()
+        elif action['type'] == 'place_node':
+            parent = action['parent']
+            x, y = action['x'], action['y']
+            strength = action['strength']
+            # 检查合法性
+            if not parent.can_have_child():
+                self._end_turn()
+                return
+            strength_cost = max(0, strength - 1)
+            if self.points[self.current_team] < strength_cost:
+                self._end_turn()
+                return
+            # 创建节点
+            new_node = Node(self.current_team, x, y, strength, parent=parent)
+            parent.children.append(new_node)
+            self.nodes.append(new_node)
+            self.points[self.current_team] -= strength_cost
+            play_sfx('tap', strength=strength)
+            removed_ids, winner, weakened = self._resolve_crossing(new_node)
+            if removed_ids or weakened:
+                play_sfx('shear')
+            if winner:
+                play_sfx('victory' if self.my_team == winner else 'heavy_hit')
+            self.has_created_this_turn = True
 
     def _end_turn(self):
         # 客户端模式：发送结束回合请求给服务器
