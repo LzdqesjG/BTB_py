@@ -81,11 +81,15 @@ class AntiCheat:
         if len(parent.children) >= MAX_CHILDREN:
             return self._violation(f"父节点 id={parent.id} 子节点已满")
 
-        # 7. 新节点必须在父节点范围圈内
+        # 7. 新节点必须在父节点范围圈内（允许超出 1 像素公差）
         dx, dy = x - parent.x, y - parent.y
-        if dx * dx + dy * dy > radius * radius:
+        dist_sq = dx * dx + dy * dy
+        max_sq = radius * radius
+        if dist_sq > (radius + 1) * (radius + 1):
             return self._violation(
-                f"新节点超出范围: dist={math.sqrt(dx * dx + dy * dy):.1f} > radius={radius}")
+                f"新节点超出范围: dist={math.sqrt(dist_sq):.1f} > radius={radius}")
+        if dist_sq > max_sq:
+            print(f"[ANTI-CHEAT] 警告：范围边缘公差，dist={math.sqrt(dist_sq):.2f} > radius={radius}，差值 < 1，放行")
 
         # 8. 验证分数消耗
         strength_cost = max(0, strength - 1)

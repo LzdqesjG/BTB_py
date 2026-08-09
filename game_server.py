@@ -154,7 +154,7 @@ class GameServer:
         parent.children.append(new_node)
         game.nodes.append(new_node)
         game.points['BLUE'] -= total
-        removed_ids, winner = game._resolve_crossing(new_node)
+        removed_ids, winner, weakened = game._resolve_crossing(new_node)
         game.has_created_this_turn = True
 
         # 广播动作给客户端（与主机 _try_create_node 一致）
@@ -162,6 +162,9 @@ class GameServer:
                    new_node.strength, new_node.parent.id, new_node.id)
         if removed_ids:
             self._send(proto.ACT_REMOVE_NODES, *removed_ids)
+        # 广播被削弱但未删除的节点
+        for nid, new_str in weakened.items():
+            self._send(proto.ACT_UPDATE_STRENGTH, nid, new_str)
         self._send(proto.ACT_SYNC_POINTS, game.points['RED'], game.points['BLUE'])
         self._send(proto.ACT_SYNC_PICKUPS, proto.serialize_pickups(game.pickups))
         self._send(proto.ACT_SYNC_TURN, game.current_team, str(game.has_created_this_turn), game.turn_count)

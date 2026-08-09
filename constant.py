@@ -1,7 +1,7 @@
-# 版本号
-VERSION = '1.3'
+"""游戏常量与字体配置。"""
+import os
+import sys
 
-# 常量
 SCREEN_WIDTH, SCREEN_HEIGHT = 1300, 700
 FPS = 60
 NODE_RADIUS = 18
@@ -52,3 +52,54 @@ STATE_CLIENT_WAIT = 'client_wait'  # 客户端等待房主开始
 STATE_JOIN_INPUT = 'join_input'    # 客户端输入IP
 STATE_CONNECTING = 'connecting'    # 客户端连接中
 DEFAULT_PORT = 8447
+
+# ===== 字体配置 =====
+# 中文字体候选路径（按优先级排序，跨平台）
+FONT_CANDIDATES = [
+    # Windows
+    r"C:\Windows\Fonts\msyh.ttc",      # 微软雅黑
+    r"C:\Windows\Fonts\msyhbd.ttc",    # 微软雅黑粗体
+    r"C:\Windows\Fonts\simhei.ttf",    # 黑体
+    r"C:\Windows\Fonts\simsun.ttc",    # 宋体
+    r"C:\Windows\Fonts\simkai.ttf",    # 楷体
+    r"C:\Windows\Fonts\simli.ttf",     # 隶书
+]
+
+# 粗体优先候选（会插在列表最前面）
+FONT_BOLD_CANDIDATES = [
+    r"C:\Windows\Fonts\msyhbd.ttc",
+    r"C:\Windows\Fonts\simhei.ttf",
+]
+
+
+def get_cjk_font(size, bold=False):
+    """跨平台中文字体加载。
+
+    优先使用 FONT_CANDIDATES 中的系统字体，
+    找不到则回退到 pygame 默认字体（可能缺中文）。
+
+    Args:
+        size: 字号
+        bold: 是否优先粗体
+    Returns:
+        pygame.font.Font
+    """
+    import pygame.font
+
+    candidates = list(FONT_CANDIDATES)
+    if bold:
+        # 粗体优先排在前面
+        candidates = FONT_BOLD_CANDIDATES + candidates
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                return pygame.font.Font(path, size)
+            except Exception:
+                continue
+    # 回退
+    return pygame.font.Font(None, size)
+
+
+def get_font(size, bold=False):
+    """用户可直接修改此函数来自定义字体。"""
+    return get_cjk_font(size, bold=bold)

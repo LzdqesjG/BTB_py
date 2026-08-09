@@ -2,6 +2,7 @@ import pygame
 import pygame.gfxdraw
 import math
 import sys
+import os
 import random
 
 from constant import *
@@ -9,10 +10,7 @@ from constant import *
 pygame.init()
 
 
-font_big = get_font(36, bold=True)
-font_mid = get_font(22)
-font_small = get_font(16)
-font_tiny = get_font(13)
+# ===== 抗锯齿圆形绘制辅助 =====
 
 def _draw_aa_circle(surface, color, center, radius):
     """绘制抗锯齿实心圆（填充 + AA 描边）。
@@ -59,6 +57,67 @@ def _draw_aa_circle_outline(surface, color, center, radius, width=1):
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption("Binary Tree Battle - 二叉树战斗")
 clock = pygame.time.Clock()
+
+
+from PIL import Image, ImageDraw, ImageFont
+class CJKFont:
+    def __init__(self, size, bold=False):
+        # 候选字体路径（按优先级，先系统字体，后 Termux 自带）
+        candidates = [
+            "/system/fonts/NotoSansCJK-Regular.ttc",   # Android 8+ 中文字体
+            "/system/fonts/DroidSansFallback.ttf",     # 旧版 Android 中文字体
+            "/system/fonts/NotoSansSC-Regular.otf",    # 简体中文
+            "/system/fonts/NotoSansTC-Regular.otf",    # 繁体中文
+        ]
+        # 如果指定粗体，尝试粗体版本（许多系统没有单独的粗体文件，会 fallback）
+        if bold:
+            candidates = [
+                "/system/fonts/NotoSansCJK-Bold.ttc",
+                "/system/fonts/DroidSansFallback-Bold.ttf",
+            ] + candidates  # 先尝试粗体，找不到再普通
+
+        # 最后后备：Termux 自带的 DejaVu（不支持中文，但避免报错）
+        candidates.append("/data/data/com.termux/files/usr/share/fonts/TTF/DejaVuSans.ttf")
+
+        self.font_path = None
+        for path in candidates:
+            if os.path.exists(path):
+                self.font_path = path
+                break
+
+        if self.font_path is None:
+            raise FileNotFoundError("没有找到任何字体文件，请检查路径")
+
+        self.size = size
+
+    def render(self, text, antialias=True, color=(255, 255, 255), background=None):
+        font = ImageFont.truetype(self.font_path, self.size)
+
+        # 计算文字尺寸（Pillow 9+ 推荐 textbbox）
+        dummy_img = Image.new('RGBA', (1, 1))
+        dummy_draw = ImageDraw.Draw(dummy_img)
+        bbox = dummy_draw.textbbox((0, 0), text, font=font)
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+
+        # 创建图片并绘制文字
+        img = Image.new('RGBA', (w, h), (0, 0, 0, 0) if background is None else background)
+        draw = ImageDraw.Draw(img)
+        draw.text((-bbox[0], -bbox[1]), text, font=font, fill=color)
+
+        # 转换为 Pygame Surface
+        data = img.tobytes()
+        surf = pygame.image.fromstring(data, img.size, 'RGBA')
+        return surf
+
+def _load_cjk_font(size, bold=False):
+    return CJKFont(size, bold)
+
+
+font_big = _load_cjk_font(36, bold=True)
+font_mid = _load_cjk_font(22)
+font_small = _load_cjk_font(16)
+font_tiny = _load_cjk_font(13)
 
 
 class Node:
@@ -587,8 +646,7 @@ class Game:
         """
         新节点 new_node 创建完成后，检查新树枝（new_node.parent -> new_node）
         是否穿过对方队伍的树枝或节点。
-        返回 (removed_ids: set[int], winner: str|None, weakened: dict[int, int])
-            weakened: {节点id → 新强度}  被削弱但未删除的节点
+        返回 (removed_ids: set[int], winner: str|None)
         规则1（穿树枝）：对方树枝（child 与 parent 连线）被穿过 →
           child.strength -= new_node.strength，≤0 删除 child 及其所有后代。
         规则2（穿节点）：新树枝穿过对方某节点圆 →
@@ -596,9 +654,8 @@ class Game:
           - 否则 → 该节点 strength -= new_node.strength，≤0 删除子树。
         """
         removed_ids = set()
-        weakened = {}  # {node_id: new_strength}
         if new_node.parent is None:
-            return removed_ids, None, weakened
+            return removed_ids, None
         p_new = (new_node.parent.x, new_node.parent.y)
         q_new = (new_node.x, new_node.y)
         attacker_strength = new_node.strength
@@ -624,7 +681,7 @@ class Game:
         if hit_root is not None:
             self.winner = attacker_team
             self.state = STATE_GAME_OVER
-            return removed_ids, attacker_team, weakened
+            return removed_ids, attacker_team
 
         # ===== 2. 检查穿过对方树枝（跨团队连线） =====
         cut_targets = []  # list[对方子节点 child_node（被切的那条线的终点）]
@@ -658,7 +715,7 @@ class Game:
         # ===== 3. 结算：节点切断 + 树枝切断 =====
         all_targets = node_cut_targets + cut_targets
         if not all_targets:
-            return removed_ids, None, weakened
+            return removed_ids, None
 
         processed = set()
         for victim in all_targets:
@@ -673,11 +730,8 @@ class Game:
                 for sn in subtree:
                     removed_ids.add(sn.id)
                 self._remove_nodes(subtree)
-            else:
-                # 节点存活但强度降低了，记录以供广播
-                weakened[victim.id] = victim.strength
 
-        return removed_ids, None, weakened
+        return removed_ids, None
 
     @staticmethod
     def _point_in_range(px, py, node, radius):
@@ -1009,6 +1063,7 @@ class Game:
             self._handle_game_over_event(event)
         elif self.state == STATE_PLAYING:
             self._handle_playing_event(event)
+         
 
     def _start_host(self):
         """启动房主服务器，进入等待状态。"""
@@ -1168,7 +1223,10 @@ class Game:
         # 滚轮事件 (pygame 2 / SDL2): pygame.MOUSEWHEEL
         if event.type == pygame.MOUSEWHEEL:
             self._handle_wheel(1 if event.y > 0 else -1)
-
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
+            self._handle_wheel(1)      # 向上键 → 强度+1
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
+            self._handle_wheel(-1)     # 向下键 → 强度-1<
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             if self.dragging and self.drag_node is not None:
                 mx, my = event.pos
@@ -1267,7 +1325,7 @@ class Game:
         self.nodes.append(new_node)
         self.points[self.current_team] -= total
         # 结算：新树枝穿过对方树枝 → 扣强度 / 删除子树
-        removed_ids, winner, weakened = self._resolve_crossing(new_node)
+        removed_ids, winner = self._resolve_crossing(new_node)
         # 一回合只能创建一个节点，但不自动结束回合
         self.has_created_this_turn = True
 
@@ -1280,9 +1338,6 @@ class Game:
             # 2. 广播删除的节点
             if removed_ids:
                 self._broadcast(proto.ACT_REMOVE_NODES, *removed_ids)
-            # 3. 广播被削弱但未删除的节点（强度变化）
-            for nid, new_str in weakened.items():
-                self._broadcast(proto.ACT_UPDATE_STRENGTH, nid, new_str)
             # 3. 同步回合/点数/点数包
             self._broadcast_state_changed()
 
