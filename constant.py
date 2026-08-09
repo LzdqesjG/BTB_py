@@ -1,3 +1,6 @@
+# 版本号
+VERSION = '1.3'
+
 # 常量
 SCREEN_WIDTH, SCREEN_HEIGHT = 1300, 700
 FPS = 60
