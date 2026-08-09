@@ -54,6 +54,8 @@ STATE_HOST_WAIT = 'host_wait'      # 房主等待玩家加入
 STATE_CLIENT_WAIT = 'client_wait'  # 客户端等待房主开始
 STATE_JOIN_INPUT = 'join_input'    # 客户端输入IP
 STATE_CONNECTING = 'connecting'    # 客户端连接中
+STATE_REPLAY_SELECT = 'replay_select'  # 回放文件选择
+STATE_REPLAY_PLAY = 'replay_play'      # 回放播放中
 DEFAULT_PORT = 8447
 
 # ===== 音效配置 =====

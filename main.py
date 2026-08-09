@@ -7,6 +7,9 @@ import random
 
 from constant import *
 
+# 回放系统
+from replay import ReplayRecorder
+
 pygame.init()
 
 _sfx_bank = {}         # {filename: Sound}
@@ -290,6 +293,13 @@ class Game:
         self._ai_team = None          # AI 控制的队伍
         self._ai_think_timer = 0
 
+        # 回放记录器
+        self.replay = ReplayRecorder()
+
+        # 回放选择
+        self._replay_files = []
+        self._replay_selected = 0
+
     def reset(self):
         Node._next_id = 0
         self.nodes = []
@@ -312,6 +322,13 @@ class Game:
         self.pickups = []
         self.score_popups = []
         self._init_pickups()
+
+        # 回放：记录初始状态
+        self.replay = ReplayRecorder()
+        self.replay.record('init',
+                           red_points=self.points['RED'], blue_points=self.points['BLUE'])
+        for p in self.pickups:
+            self.replay.record('spawn_pack', x=p.x, y=p.y, value=p.value)
 
     def start_game(self):
         self.reset()
@@ -422,6 +439,7 @@ class Game:
         elif cmd == proto.ACT_GAME_OVER:
             self.winner = params[0]
             self.state = STATE_GAME_OVER
+            self.replay.record('game_over', winner=self.winner)
             # 按己方队伍播放胜利或失败音效
             if self.my_team and self.my_team == self.winner:
                 play_sfx('victory')
@@ -520,12 +538,18 @@ class Game:
             self.pickups.remove(pack)
             # 加分
             self.points[node.team] += pack.value
+            # 回放：记录拾取
+            self.replay.record('pickup', team=node.team, value=pack.value,
+                               x=pack.x, y=pack.y)
             # 视觉反馈
             self.score_popups.append(ScorePopup(pack.x, pack.y, pack.value, node.team))
             play_sfx('orb', value=pack.value)
             # 全图生成新点数包
             new_pack = self._spawn_pickup(half=None)
             self.pickups.append(new_pack)
+            # 回放：记录新生成的点数包
+            self.replay.record('spawn_pack', x=new_pack.x, y=new_pack.y,
+                               value=new_pack.value)
 
     def update(self):
         """每帧更新。"""
@@ -550,6 +574,10 @@ class Game:
             # 断线检测
             if self.net_client and not self.net_client.connected:
                 self.go_menu()
+            return
+
+        if self.state == STATE_GAME_OVER:
+            self.replay.save()
             return
 
         if self.state != STATE_PLAYING:
@@ -938,8 +966,29 @@ class Game:
                      font_mid.render("加入房间", True, WHITE).get_rect(center=btn4.center))
         self._btn_join = btn4
 
+        # 回放 / 设置 按钮（第二行）
+        btn2_y = btn_y + btn_h + 12
+        btn2_w = 130
+        bx5 = SCREEN_WIDTH // 2 - btn2_w - 8
+
+        # 回放
+        self._btn_replay = pygame.Rect(bx5, btn2_y, btn2_w, btn_h)
+        hr = self._btn_replay.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, (60, 140, 160) if hr else (35, 90, 110), self._btn_replay, border_radius=8)
+        pygame.draw.rect(surface, WHITE, self._btn_replay, 2, border_radius=8)
+        surface.blit(font_mid.render("回放", True, WHITE),
+                     font_mid.render("回放", True, WHITE).get_rect(center=self._btn_replay.center))
+
+        # 设置（预留）
+        self._btn_settings = pygame.Rect(SCREEN_WIDTH // 2 + 8, btn2_y, btn2_w, btn_h)
+        hs = self._btn_settings.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, (100, 100, 100) if hs else (60, 60, 60), self._btn_settings, border_radius=8)
+        pygame.draw.rect(surface, WHITE, self._btn_settings, 2, border_radius=8)
+        surface.blit(font_mid.render("设置", True, WHITE),
+                     font_mid.render("设置", True, WHITE).get_rect(center=self._btn_settings.center))
+
         # 右下角版本号与作者
-        ver_text = font_tiny.render(f"{VERSION}  by {AUTHOR}", True, (80, 80, 100))
+        ver_text = font_tiny.render(f"Binary Tree Battle {VERSION}  by {AUTHOR}", True, (80, 80, 100))
         surface.blit(ver_text, (SCREEN_WIDTH - ver_text.get_width() - 12, SCREEN_HEIGHT - 22))
 
     # ===== 游戏结束绘制 =====
@@ -1087,6 +1136,17 @@ class Game:
         ttt = font_small.render(f"当前: {turn_name} 行动", True, turn_color)
         surface.blit(ttt, ttt.get_rect(center=(hud_turn.centerx, hud_turn.y + 44)))
 
+        # 退出按钮（回合面板下方）
+        mouse_pos = pygame.mouse.get_pos()
+        exit_btn_w, exit_btn_h = 70, 24
+        self.exit_btn_rect = pygame.Rect(hud_turn.centerx - exit_btn_w // 2, 75, exit_btn_w, exit_btn_h)
+        eh = self.exit_btn_rect.collidepoint(mouse_pos)
+        ec = (160, 50, 50) if eh else (100, 35, 35)
+        pygame.draw.rect(surface, ec, self.exit_btn_rect, border_radius=4)
+        pygame.draw.rect(surface, WHITE, self.exit_btn_rect, 1, border_radius=4)
+        ex = font_tiny.render("退出", True, WHITE)
+        surface.blit(ex, ex.get_rect(center=self.exit_btn_rect.center))
+
         # 拖动时强度+范围提示
         if self.dragging:
             tip_y = 90
@@ -1144,6 +1204,10 @@ class Game:
             self._handle_join_input_event(event)
         elif self.state == STATE_GAME_OVER:
             self._handle_game_over_event(event)
+        elif self.state == STATE_REPLAY_SELECT:
+            self._handle_replay_select_event(event)
+        elif self.state == STATE_REPLAY_PLAY:
+            self._handle_replay_play_event(event)
         elif self.state == STATE_PLAYING:
             self._handle_playing_event(event)
 
@@ -1203,6 +1267,24 @@ class Game:
                 self.state = STATE_JOIN_INPUT
                 self.ip_input = ''
                 self.connect_error = None
+            elif hasattr(self, '_btn_replay') and self._btn_replay.collidepoint(event.pos):
+                play_sfx('click')
+                self._enter_replay_select()
+            elif hasattr(self, '_btn_settings') and self._btn_settings.collidepoint(event.pos):
+                play_sfx('click')
+                # 设置：预留
+
+    def _enter_replay_select(self):
+        """进入回放文件选择界面。"""
+        replay_dir = os.path.join(os.path.dirname(__file__), 'replays')
+        if os.path.isdir(replay_dir):
+            self._replay_files = sorted(
+                [f for f in os.listdir(replay_dir) if f.endswith('.bpr')],
+                reverse=True)
+        else:
+            self._replay_files = []
+        self._replay_selected = 0
+        self.state = STATE_REPLAY_SELECT
 
     def _handle_host_wait_event(self, event):
         if event.type == pygame.QUIT:
@@ -1283,6 +1365,13 @@ class Game:
             pygame.quit()
             sys.exit()
 
+        # 退出按钮：任何时候都能点
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if hasattr(self, 'exit_btn_rect') and self.exit_btn_rect.collidepoint(event.pos):
+                play_sfx('click')
+                self.go_menu()
+                return
+
         # 网络模式/AI模式：非己方回合时只允许鼠标移动
         if self._ai_mode:
             is_my_turn = (self.current_team != self._ai_team)
@@ -1360,11 +1449,15 @@ class Game:
             if direction > 0:
                 # 滚轮上 → 强度+1，消耗1点
                 if child.strength < MAX_STRENGTH and self.points[self.current_team] >= 1:
+                    old_str = child.strength
                     if self.network_mode == 'client' and self.net_client:
                         self.net_client.send_modify_branch(child.x, child.y, child.strength + 1)
                     else:
                         child.strength += 1
                         self.points[self.current_team] -= 1
+                        self.replay.record('modify_branch', team=self.current_team,
+                                           node_id=child.id, old_strength=old_str,
+                                           new_strength=child.strength)
                         if self.network_mode == 'host':
                             import network_protocol as proto
                             self._broadcast(proto.ACT_UPDATE_STRENGTH, child.id, child.strength)
@@ -1373,11 +1466,15 @@ class Game:
             elif direction < 0:
                 # 滚轮下 → 强度-1（最低1），返还1点
                 if child.strength > MIN_STRENGTH:
+                    old_str = child.strength
                     if self.network_mode == 'client' and self.net_client:
                         self.net_client.send_modify_branch(child.x, child.y, child.strength - 1)
                     else:
                         child.strength -= 1
                         self.points[self.current_team] += 1
+                        self.replay.record('modify_branch', team=self.current_team,
+                                           node_id=child.id, old_strength=old_str,
+                                           new_strength=child.strength)
                         if self.network_mode == 'host':
                             import network_protocol as proto
                             self._broadcast(proto.ACT_UPDATE_STRENGTH, child.id, child.strength)
@@ -1429,8 +1526,21 @@ class Game:
         self.nodes.append(new_node)
         self.points[self.current_team] -= total
         play_sfx('tap', strength=new_node.strength)
+
+        # 回放：记录放置节点
+        self.replay.record('place_node', team=self.current_team,
+                           parent_id=node.id, node_id=new_node.id,
+                           x=mx, y=my, strength=strength, range=radius)
+
         # 结算：新树枝穿过对方树枝 → 扣强度 / 删除子树
         removed_ids, winner, weakened = self._resolve_crossing(new_node)
+        if removed_ids:
+            self.replay.record('remove_nodes', ids=sorted(removed_ids))
+        for nid, new_str in sorted(weakened.items()):
+            self.replay.record('weaken_node', node_id=nid,
+                               new_strength=new_str)
+        if winner:
+            self.replay.record('game_over', winner=winner)
         if removed_ids or weakened:
             play_sfx('shear')
         if winner:
@@ -1491,7 +1601,20 @@ class Game:
             self.nodes.append(new_node)
             self.points[self.current_team] -= strength_cost
             play_sfx('tap', strength=strength)
+
+            # 回放：记录 AI 放置节点
+            self.replay.record('place_node', team=self.current_team,
+                               parent_id=parent.id, node_id=new_node.id,
+                               x=x, y=y, strength=strength, range=0)
+
             removed_ids, winner, weakened = self._resolve_crossing(new_node)
+            if removed_ids:
+                self.replay.record('remove_nodes', ids=sorted(removed_ids))
+            for nid, new_str in sorted(weakened.items()):
+                self.replay.record('weaken_node', node_id=nid,
+                                   new_strength=new_str)
+            if winner:
+                self.replay.record('game_over', winner=winner)
             if removed_ids or weakened:
                 play_sfx('shear')
             if winner:
@@ -1512,6 +1635,11 @@ class Game:
         self.dragging = False
         self.drag_node = None
         self.hovered_branch_child = None
+
+        # 回放：记录结束回合
+        previous_team = self.current_team
+        self.replay.record('end_turn', team=previous_team)
+
         if self.current_team == 'RED':
             self.current_team = 'BLUE'
         else:
@@ -1534,6 +1662,10 @@ class Game:
             self.draw_join_input(surface)
         elif self.state == STATE_GAME_OVER:
             self.draw_game_over(surface)
+        elif self.state == STATE_REPLAY_SELECT:
+            self.draw_replay_select(surface)
+        elif self.state == STATE_REPLAY_PLAY:
+            self.draw_replay_play(surface)
         else:
             self.draw_playing(surface)
 
@@ -1544,7 +1676,7 @@ class Game:
             for i, (fname, _t) in enumerate(reversed(_sfx_debug_log)):
                 fnamee = fname.replace(fname.split('.')[-1], "")[:-1]
                 finaltext = f"[DEBUG] Sound #{i} - {fnamee}"
-                txt = font_tiny.render(finaltext, True, (random.randint(96, 255), random.randint(96, 255), random.randint(96, 255)))
+                txt = font_tiny.render(finaltext, True, (102, 204, 255))
                 surface.blit(txt, (10, SCREEN_HEIGHT - 20 - i * 16))
 
     def draw_host_wait(self, surface):
@@ -1563,8 +1695,8 @@ class Game:
         surface.blit(port_txt, port_txt.get_rect(center=port_rect.center))
         self._host_port_rect = port_rect
 
-        info = font_small.render("服务器地址: 0.0.0.0:PORT", True, DARK_GRAY)
-        info = font_small.render(f"服务器地址: 0.0.0.0:{self.host_port}", True, DARK_GRAY)
+        info = font_small.render("服务器地址: 127.0.0.1:PORT", True, DARK_GRAY)
+        info = font_small.render(f"服务器地址: 127.0.0.1:{self.host_port}", True, DARK_GRAY)
         surface.blit(info, info.get_rect(center=(SCREEN_WIDTH // 2, 295)))
 
         tip = font_tiny.render("提示: 若客户端无法连接，请检查防火墙是否放行", True, (180, 180, 100))
@@ -1667,6 +1799,106 @@ class Game:
             if hasattr(self, '_client_wait_back_rect') and self._client_wait_back_rect.collidepoint(event.pos):
                 play_sfx('click')
                 self.go_menu()
+
+    # ===== 回放系统 =====
+    def draw_replay_select(self, surface):
+        """回放文件选择界面。"""
+        surface.fill(BG_COLOR)
+        title = font_big.render("选择回放文件", True, WHITE)
+        surface.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 60)))
+
+        if not self._replay_files:
+            hint = font_mid.render("暂无回放文件", True, GRAY)
+            surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)))
+        else:
+            # 文件列表
+            list_start_y = 120
+            visible_count = min(len(self._replay_files), 15)
+            for i in range(visible_count):
+                idx = i
+                if idx >= len(self._replay_files):
+                    break
+                fname = self._replay_files[idx]
+                y = list_start_y + i * 32
+                is_selected = (idx == self._replay_selected)
+                # 选中高亮
+                if is_selected:
+                    bar = pygame.Rect(SCREEN_WIDTH // 2 - 280, y - 2, 560, 28)
+                    pygame.draw.rect(surface, (50, 80, 150), bar, border_radius=4)
+                # 尝试解析文件时间
+                label = fname
+                if len(fname) >= 15:
+                    label = f"{fname[:4]}-{fname[4:6]}-{fname[6:8]}  {fname[9:11]}:{fname[11:13]}:{fname[13:15]}"
+                c = WHITE if is_selected else GRAY
+                txt = font_mid.render(label, True, c)
+                surface.blit(txt, txt.get_rect(center=(SCREEN_WIDTH // 2, y + 10)))
+
+        # 底部提示
+        hint = font_tiny.render("↑↓ 选择   Enter 确认   Esc 返回", True, DARK_GRAY)
+        surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 20)))
+
+    def _handle_replay_select_event(self, event):
+        """回放文件选择事件处理。"""
+        if event.type == pygame.QUIT:
+            pygame.quit()
+            sys.exit()
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self.state = STATE_MENU
+            elif event.key == pygame.K_UP:
+                if self._replay_files:
+                    self._replay_selected = max(0, self._replay_selected - 1)
+            elif event.key == pygame.K_DOWN:
+                if self._replay_files:
+                    self._replay_selected = min(len(self._replay_files) - 1, self._replay_selected + 1)
+            elif event.key == pygame.K_RETURN:
+                if self._replay_files:
+                    play_sfx('click')
+                    self._start_replay(self._replay_files[self._replay_selected])
+
+    def _start_replay(self, filename):
+        """开始回放（预留）。"""
+        self.reset()
+        self.state = STATE_REPLAY_PLAY
+
+    def draw_replay_play(self, surface):
+        """回放播放界面（预留，空对局）。"""
+        surface.fill(BG_COLOR)
+        # 显示两个根节点
+        for node in self.nodes:
+            if node.parent is not None:
+                p = node.parent
+                width = max(1, node.strength)
+                color = TEAM_COLORS[node.team]['light']
+                pygame.draw.line(surface, color, (int(p.x), int(p.y)),
+                                 (int(node.x), int(node.y)), width)
+            node.draw(surface)
+        # 顶部信息
+        hud = pygame.Rect((SCREEN_WIDTH - 300) // 2, 8, 300, 36)
+        pygame.draw.rect(surface, PANEL_COLOR, hud, border_radius=6)
+        txt = font_mid.render("回放模式 - 开发中", True, GRAY)
+        surface.blit(txt, txt.get_rect(center=hud.center))
+        # 返回按钮
+        mouse_pos = pygame.mouse.get_pos()
+        back_rect = pygame.Rect(SCREEN_WIDTH - 120, SCREEN_HEIGHT - 50, 100, 34)
+        h = back_rect.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, GREEN if h else (40, 140, 40), back_rect, border_radius=6)
+        pygame.draw.rect(surface, WHITE, back_rect, 2, border_radius=6)
+        t = font_small.render("返回", True, WHITE)
+        surface.blit(t, t.get_rect(center=back_rect.center))
+        self._replay_back_rect = back_rect
+
+    def _handle_replay_play_event(self, event):
+        """回放播放事件处理。"""
+        if event.type == pygame.QUIT:
+            pygame.quit()
+            sys.exit()
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if hasattr(self, '_replay_back_rect') and self._replay_back_rect.collidepoint(event.pos):
+                play_sfx('click')
+                self.go_menu()
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self.go_menu()
 
 
 def main():

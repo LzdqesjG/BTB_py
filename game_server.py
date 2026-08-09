@@ -154,7 +154,21 @@ class GameServer:
         parent.children.append(new_node)
         game.nodes.append(new_node)
         game.points['BLUE'] -= total
+
+        # 回放：记录蓝队放置节点
+        game.replay.record('place_node', team='BLUE',
+                           parent_id=parent.id, node_id=new_node.id,
+                           x=x, y=y, strength=strength, range=radius)
+
         removed_ids, winner, weakened = game._resolve_crossing(new_node)
+        if removed_ids:
+            game.replay.record('remove_nodes', ids=sorted(removed_ids))
+        for nid, new_str in sorted(weakened.items()):
+            game.replay.record('weaken_node', node_id=nid,
+                               new_strength=new_str)
+        if winner:
+            game.replay.record('game_over', winner=winner)
+
         game.has_created_this_turn = True
 
         # 音效
@@ -201,12 +215,18 @@ class GameServer:
         target = self._find_blue_node(nx, ny, require_parent=True)
 
         # 计算消耗/返还
+        old_str = target.strength
         diff = target_strength - target.strength
         if diff > 0:
             game.points['BLUE'] -= diff
         else:
             game.points['BLUE'] += -diff
         target.strength = target_strength
+
+        # 回放：记录蓝队修改树枝强度
+        game.replay.record('modify_branch', team='BLUE',
+                           node_id=target.id, old_strength=old_str,
+                           new_strength=target_strength)
 
         # 广播动作
         self._send(proto.ACT_UPDATE_STRENGTH, target.id, target.strength)

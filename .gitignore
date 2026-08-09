@@ -12,3 +12,6 @@ Packages/
 
 # Test files
 tests/
+
+# Replay files
+replay/*
