@@ -87,6 +87,7 @@ class AIThinker:
         self._fc = _CONFIG['force_cut_nearby']
         self._fz = _CONFIG['force_defend_zone']
         self._fd = _CONFIG['force_defend_root']
+        self._fa = _CONFIG['force_attack_root']
 
     def _find_root(self, team):
         for n in self.game.nodes:
@@ -99,14 +100,19 @@ class AIThinker:
     def decide_action(self):
         """返回 AI 的下一步动作。
 
-        优先级：拾取 > 主动切割 > 警戒区拦截 > 根紧急防御 > 调枝 > 常规放置 > 结束
+        优先级：拾取 > 穿敌方根 > 主动切割 > 警戒区拦截 > 根紧急防御 > 调枝 > 常规放置 > 结束
         """
         # 硬规则 1：点数包在范围内 → 优先拾取
         pickup_action = self._force_pickup()
         if pickup_action:
             return pickup_action
 
-        # 硬规则 2：敌方节点在范围内 → 主动切割
+        # 硬规则 2：己方节点接近敌方根 → 尝试穿过敌方根
+        attack_root_action = self._force_attack_root()
+        if attack_root_action:
+            return attack_root_action
+
+        # 硬规则 3：敌方节点在范围内 → 主动切割
         cut_action = self._force_cut_nearby()
         if cut_action:
             return cut_action
@@ -306,6 +312,57 @@ class AIThinker:
 
             target_x = threatening_enemy.x + (dx / d) * extend
             target_y = threatening_enemy.y + (dy / d) * extend
+
+            if not self._in_bounds(target_x, target_y):
+                continue
+            if self._too_close_to_any(target_x, target_y):
+                continue
+
+            target_dist = math.hypot(target_x - node.x, target_y - node.y)
+            range_index = self._dist_to_range(target_dist)
+
+            max_afford = max(1, min(MAX_STRENGTH, 1 + self._points - range_index))
+            strength = max(min_str, min(MAX_STRENGTH, max_afford))
+            if strength < min_str:
+                strength = min(MAX_STRENGTH, max_afford)
+
+            if range_index + (strength - 1) > self._points:
+                continue
+
+            return {
+                'type': 'place_node',
+                'parent': node,
+                'x': target_x,
+                'y': target_y,
+                'strength': strength,
+            }
+        return None
+
+    def _force_attack_root(self):
+        """己方节点接近敌方根 → 尝试画线穿过敌方根节点（致命一击）。"""
+        if self._enemy_root is None:
+            return None
+
+        attack_range = self._fa['range']
+        extend = NODE_RADIUS * self._fa['extend_ratio']
+        min_str = self._fa['min_strength']
+
+        own_nodes = [n for n in self.game.nodes
+                     if n.team == self._team and n.can_have_child()]
+
+        for node in own_nodes:
+            d = math.hypot(node.x - self._enemy_root.x, node.y - self._enemy_root.y)
+            if d > attack_range:
+                continue
+
+            # 从 node 沿 enemy_root 方向，在根后方落点
+            dx = self._enemy_root.x - node.x
+            dy = self._enemy_root.y - node.y
+            if d < 1:
+                continue
+
+            target_x = self._enemy_root.x + (dx / d) * extend
+            target_y = self._enemy_root.y + (dy / d) * extend
 
             if not self._in_bounds(target_x, target_y):
                 continue

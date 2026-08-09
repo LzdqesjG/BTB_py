@@ -156,5 +156,15 @@
         "_extend_ratio_note": "落点在敌方后方的延伸距离 (×NODE_RADIUS)",
 
         "min_strength": 3
+    },
+
+    "force_attack_root": {
+        "range": 250,
+        "_range_note": "己方节点离敌方根在此范围内时尝试穿过敌方根",
+
+        "extend_ratio": 2.0,
+        "_extend_ratio_note": "落点在敌方根后方的延伸距离 (×NODE_RADIUS)",
+
+        "min_strength": 3
     }
 }

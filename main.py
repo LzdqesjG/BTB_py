@@ -302,6 +302,7 @@ class Game:
         self._ai_mode = False
         self._ai_team = None          # AI 控制的队伍
         self._ai_think_timer = 0
+        self._resume_from_replay = False
 
         # 回放记录器
         self.replay = ReplayRecorder()
@@ -310,7 +311,7 @@ class Game:
         self._replay_files = []
         self._replay_selected = 0
 
-    def reset(self):
+    def reset(self, game_info=None):
         Node._next_id = 0
         self.nodes = []
         self.points = {'RED': INITIAL_POINTS, 'BLUE': INITIAL_POINTS}
@@ -333,15 +334,17 @@ class Game:
         self.score_popups = []
         self._init_pickups()
 
-        # 回放：记录初始状态
+        # 回放：记录对局信息（首行），然后是初始状态
         self.replay = ReplayRecorder()
+        if game_info:
+            self.replay.record('game_info', **game_info)
         self.replay.record('init',
                            red_points=self.points['RED'], blue_points=self.points['BLUE'])
         for p in self.pickups:
             self.replay.record('spawn_pack', x=p.x, y=p.y, value=p.value)
 
     def start_game(self):
-        self.reset()
+        self.reset(game_info={'mode': 'single'})
         self.state = STATE_PLAYING
 
     def start_host_game(self):
@@ -349,7 +352,7 @@ class Game:
         import network_protocol as proto
         self.network_mode = 'host'
         self.my_team = 'RED'
-        self.reset()
+        self.reset(game_info={'mode': 'network', 'role': 'host', 'team': 'RED'})
         self.state = STATE_PLAYING
         # 发送完整初始游戏状态给客户端（含节点、点数包、回合等）
         if self.net_server and self.net_server.connected:
@@ -368,7 +371,12 @@ class Game:
         self.my_team = 'RED' if self._ai_team == 'BLUE' else 'BLUE'
         self.network_mode = None
         self._ai_think_timer = 0
-        self.reset()
+        self.reset(game_info={
+            'mode': 'ai',
+            'difficulty': 'normal',
+            'player_team': self.my_team,
+            'ai_team': self._ai_team,
+        })
         self.state = STATE_PLAYING
 
     def go_menu(self):
@@ -1295,16 +1303,78 @@ class Game:
                 # 设置：预留
 
     def _enter_replay_select(self):
-        """进入回放文件选择界面。"""
+        """进入回放文件选择界面。解析每个回放的步数和胜者。"""
         replay_dir = os.path.join(os.path.dirname(__file__), 'replays')
         if os.path.isdir(replay_dir):
-            self._replay_files = sorted(
+            files = sorted(
                 [f for f in os.listdir(replay_dir) if f.endswith('.bpr')],
                 reverse=True)
+            self._replay_files = []
+            import json
+            for fname in files:
+                steps, winner_label, mode_label = self._parse_replay_meta(fname)
+                self._replay_files.append((fname, steps, winner_label, mode_label))
         else:
             self._replay_files = []
         self._replay_selected = 0
         self.state = STATE_REPLAY_SELECT
+
+    def _parse_replay_meta(self, fname):
+        """快速解析回放文件的模式、步数和胜者标签。"""
+        import json
+        filepath = os.path.join(os.path.dirname(__file__), 'replays', fname)
+        steps = 0
+        winner = None
+        game_info = {}
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        action = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    t = action.get('type')
+                    if t == 'game_info':
+                        game_info = action
+                    elif t == 'end_turn':
+                        steps += 1
+                    elif t == 'game_over':
+                        winner = action.get('winner')
+        except (IOError, OSError):
+            pass
+
+        mode = game_info.get('mode', 'unknown')
+        mode_label = self._mode_label(game_info)
+
+        # 胜者标签
+        if winner is None:
+            winner_label = None
+        elif mode == 'ai':
+            player_team = game_info.get('player_team', '')
+            if winner == player_team:
+                winner_label = '玩家胜'
+            else:
+                winner_label = 'AI胜'
+        else:
+            winner_label = '红队胜' if winner == 'RED' else '蓝队胜'
+
+        return steps, winner_label, mode_label
+
+    @staticmethod
+    def _mode_label(game_info):
+        """将 game_info 转为简短中文标签。"""
+        mode = game_info.get('mode', 'unknown')
+        if mode == 'single':
+            return '单人'
+        elif mode == 'ai':
+            return 'AI'
+        elif mode == 'network':
+            role = game_info.get('role', '')
+            return '联机-红' if role == 'host' else '联机-蓝'
+        return '?'
 
     def _handle_host_wait_event(self, event):
         if event.type == pygame.QUIT:
@@ -1321,7 +1391,13 @@ class Game:
             if hasattr(self, '_host_start_rect') and self._host_start_rect.collidepoint(event.pos):
                 play_sfx('click')
                 if self.net_server and self.net_server.connected:
-                    self.start_host_game()
+                    if getattr(self, '_resume_from_replay', False):
+                        self._resume_from_replay = False
+                        import network_protocol as proto
+                        self.state = STATE_PLAYING
+                        self.net_server._send(proto.STATE_SYNC, proto.serialize_state(self))
+                    else:
+                        self.start_host_game()
                 else:
                     # 重新启动服务器（若之前端口改过）
                     if self.net_server:
@@ -1883,27 +1959,38 @@ class Game:
             hint = font_mid.render("暂无回放文件", True, GRAY)
             surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)))
         else:
-            # 文件列表
             list_start_y = 120
             visible_count = min(len(self._replay_files), 15)
             for i in range(visible_count):
                 idx = i
                 if idx >= len(self._replay_files):
                     break
-                fname = self._replay_files[idx]
+                fname, steps, winner_label, mode_label = self._replay_files[idx]
                 y = list_start_y + i * 32
                 is_selected = (idx == self._replay_selected)
+
                 # 选中高亮
                 if is_selected:
-                    bar = pygame.Rect(SCREEN_WIDTH // 2 - 280, y - 2, 560, 28)
+                    bar = pygame.Rect(SCREEN_WIDTH // 2 - 300, y - 2, 600, 28)
                     pygame.draw.rect(surface, (50, 80, 150), bar, border_radius=4)
-                # 尝试解析文件时间
-                label = fname
+
+                _offset = -4
+
+                # 左侧：日期时间
+                date_label = fname
                 if len(fname) >= 15:
-                    label = f"{fname[:4]}-{fname[4:6]}-{fname[6:8]}  {fname[9:11]}:{fname[11:13]}:{fname[13:15]}"
+                    date_label = f"{fname[:4]}-{fname[4:6]}-{fname[6:8]}  {fname[9:11]}:{fname[11:13]}:{fname[13:15]}"
                 c = WHITE if is_selected else GRAY
-                txt = font_mid.render(label, True, c)
-                surface.blit(txt, txt.get_rect(center=(SCREEN_WIDTH // 2, y + 10)))
+                date_txt = font_mid.render(date_label, True, c)
+                surface.blit(date_txt, (SCREEN_WIDTH // 2 - 290, y + _offset))
+
+                # 右侧：模式 + 步数和胜者
+                meta = f"[{mode_label}]  {steps} 步"
+                if winner_label:
+                    meta += f"  |  {winner_label}"
+                meta_txt = font_mid.render(meta, True, c)
+                meta_rect = meta_txt.get_rect()
+                surface.blit(meta_txt, (SCREEN_WIDTH // 2 + 290 - meta_rect.width, y + _offset))
 
         # 底部提示
         hint = font_tiny.render("↑↓ 选择   Enter 确认   Esc 返回", True, DARK_GRAY)
@@ -1922,15 +2009,17 @@ class Game:
                     n = len(self._replay_files)
                     delta = -1 if event.key == pygame.K_UP else 1
                     self._replay_selected = (self._replay_selected + delta) % n
+                    play_sfx('click')
             elif event.key == pygame.K_RETURN:
                 if self._replay_files:
                     play_sfx('click')
-                    self._start_replay(self._replay_files[self._replay_selected])
+                    self._start_replay(self._replay_files[self._replay_selected][0])
         if event.type == pygame.MOUSEWHEEL:
             if self._replay_files:
                 n = len(self._replay_files)
                 delta = -1 if event.y > 0 else 1  # 上滚=上移=索引减
                 self._replay_selected = (self._replay_selected + delta) % n
+                play_sfx('click')
 
     def _start_replay(self, filename):
         """加载回放文件，分组为步骤，构建初始棋盘。"""
@@ -2094,7 +2183,7 @@ class Game:
         mouse_pos = pygame.mouse.get_pos()
         btn_w, btn_h = 90, 30
         btn_y = hud.bottom + 8
-        total_w = btn_w * 3 + 12 * 2
+        total_w = btn_w * 4 + 12 * 3
         start_x = SCREEN_WIDTH // 2 - total_w // 2
 
         def _draw_btn(x, label, enabled, hover_color):
@@ -2120,6 +2209,12 @@ class Game:
         self._replay_next_rect = _draw_btn(bx3, "下一步",
                                            not self._is_replay_last_step(),
                                            (50, 80, 150))
+        # 进入残局按钮
+        bx4 = bx3 + btn_w + 12
+        can_enter = self.winner is None
+        self._replay_enter_rect = _draw_btn(bx4, "进入游戏",
+                                            can_enter,
+                                            (160, 120, 20))
 
         # 返回按钮
         back_rect = pygame.Rect(SCREEN_WIDTH - 120, SCREEN_HEIGHT - 50, 100, 34)
@@ -2129,6 +2224,51 @@ class Game:
         t = font_small.render("返回", True, WHITE)
         surface.blit(t, t.get_rect(center=back_rect.center))
         self._replay_back_rect = back_rect
+
+        # 残局模式选择子菜单
+        if getattr(self, '_resume_menu', False):
+            self._draw_resume_menu(surface)
+
+    def _draw_resume_menu(self, surface):
+        """绘制残局模式选择覆盖层。"""
+        # 半透明暗色背景
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 160))
+        surface.blit(overlay, (0, 0))
+
+        # 标题
+        t = font_big.render("选择残局模式", True, WHITE)
+        surface.blit(t, t.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2 - 80)))
+
+        # 三个按钮
+        btn_w, btn_h = 180, 44
+        btn_gap = 16
+        start_y = SCREEN_HEIGHT // 2 - 20
+        start_x = SCREEN_WIDTH // 2 - btn_w // 2
+
+        labels = [
+            ("本地对战",  "single"),
+            ("AI 对战",   "ai"),
+            ("创建房间",  "host"),
+        ]
+
+        mouse_pos = pygame.mouse.get_pos()
+        self._resume_buttons = labels
+        self._resume_rects = {}
+
+        for i, (label, mode) in enumerate(labels):
+            rect = pygame.Rect(start_x, start_y + i * (btn_h + btn_gap), btn_w, btn_h)
+            h = rect.collidepoint(mouse_pos)
+            color = (60, 120, 200) if h else (40, 80, 140)
+            pygame.draw.rect(surface, color, rect, border_radius=8)
+            pygame.draw.rect(surface, WHITE, rect, 2, border_radius=8)
+            t = font_mid.render(label, True, WHITE)
+            surface.blit(t, t.get_rect(center=rect.center))
+            self._resume_rects[label] = rect
+
+        # 提示
+        hint = font_small.render("ESC 返回", True, (180, 180, 180))
+        surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, start_y + 3 * (btn_h + btn_gap) + 20)))
 
     def _handle_replay_play_event(self, event):
         """回放播放事件处理。"""
@@ -2152,7 +2292,32 @@ class Game:
                 if not self._is_replay_last_step():
                     play_sfx('click')
                     self._replay_step_forward()
+            elif hasattr(self, '_replay_enter_rect') and self._replay_enter_rect.collidepoint(mp):
+                if self.winner is None:
+                    play_sfx('click')
+                    self._resume_menu = True
+                    self._resume_buttons = []
+                    self._resume_rects = {}
+        # 残局模式子菜单
+        if getattr(self, '_resume_menu', False) and event.type == pygame.MOUSEBUTTONDOWN:
+            mp = pygame.mouse.get_pos()
+            for label, mode in getattr(self, '_resume_buttons', []):
+                rect = getattr(self, '_resume_rects', {}).get(label)
+                if rect and rect.collidepoint(mp):
+                    play_sfx('click')
+                    self._resume_menu = False
+                    if mode == 'single':
+                        self._enter_game_from_replay('single')
+                    elif mode == 'ai':
+                        self._enter_game_from_replay('ai')
+                    elif mode == 'host':
+                        self._enter_game_from_replay('host')
+                    return
         if event.type == pygame.KEYDOWN:
+            if getattr(self, '_resume_menu', False):
+                if event.key == pygame.K_ESCAPE:
+                    self._resume_menu = False
+                    return
             if event.key == pygame.K_ESCAPE:
                 self.go_menu()
             elif event.key == pygame.K_LEFT:
@@ -2164,6 +2329,82 @@ class Game:
             elif event.key == pygame.K_SPACE:
                 self._replay_playing = not self._replay_playing
                 self._replay_timer = 0
+
+    def _enter_game_from_replay(self, mode='single'):
+        """从当前回放步骤进入残局模式。
+        mode: 'single' 本地对战 | 'ai' AI对战 | 'host' 创建房间"""
+        import network_protocol as proto
+
+        # 修正 Node ID 计数器
+        max_id = max(n.id for n in self.nodes) if self.nodes else 1
+        Node._next_id = max_id + 1
+
+        # 初始化新回放记录器
+        self.replay = ReplayRecorder()
+
+        if mode == 'ai':
+            self._ai_mode = True
+            self._ai_team = random.choice(['RED', 'BLUE'])
+            self.my_team = 'RED' if self._ai_team == 'BLUE' else 'BLUE'
+            self.network_mode = None
+            self._ai_think_timer = 0
+            self.replay.record('game_info', mode='ai', difficulty='normal',
+                               player_team=self.my_team, ai_team=self._ai_team)
+        elif mode == 'host':
+            self.network_mode = 'host'
+            self.my_team = 'RED'
+            self._ai_mode = False
+            self._ai_team = None
+            self._resume_from_replay = True
+            self.replay.record('game_info', mode='network', role='host', team='RED')
+        else:  # single
+            self._ai_mode = False
+            self._ai_team = None
+            self.network_mode = None
+            self.replay.record('game_info', mode='single')
+
+        self.replay.record('init',
+                           red_points=self.points['RED'],
+                           blue_points=self.points['BLUE'])
+        for p in self.pickups:
+            self.replay.record('spawn_pack', x=p.x, y=p.y, value=p.value)
+
+        # 记录当前所有节点（BFS，根的 children 先于 grandchildren）
+        from collections import deque
+        queue = deque()
+        for n in self.nodes:
+            if n.parent is None:
+                queue.append(n)
+        while queue:
+            node = queue.popleft()
+            for child in node.children:
+                self.replay.record('place_node', team=child.team,
+                                   parent_id=node.id, node_id=child.id,
+                                   x=child.x, y=child.y,
+                                   strength=child.strength, range=120)
+                queue.append(child)
+
+        # 清除回放播放相关状态
+        self._replay_steps = []
+        self._replay_id_map = {}
+        self._replay_playing = False
+        self._replay_step_index = -1
+        self._replay_timer = 0
+
+        self.winner = None
+
+        if mode == 'host':
+            from game_server import GameServer
+            self.net_server = GameServer(self, self.host_port)
+            self.net_server.start()
+            self.state = STATE_HOST_WAIT
+            print(f"[残局] 从回放进入游戏 (创建房间) | 红: {self.points['RED']}点 | "
+                  f"蓝: {self.points['BLUE']}点 | 回合: {self.current_team} T{self.turn_count}")
+        else:
+            self.state = STATE_PLAYING
+            mode_name = '单人' if mode == 'single' else 'AI'
+            print(f"[残局] 从回放进入游戏 ({mode_name}) | 红: {self.points['RED']}点 | "
+                  f"蓝: {self.points['BLUE']}点 | 回合: {self.current_team} T{self.turn_count}")
 
 
 def main():

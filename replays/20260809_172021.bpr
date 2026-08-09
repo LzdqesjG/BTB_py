@@ -1,3 +1,4 @@
+{"type": "game_info", "mode": "single"}
 {"type": "init", "red_points": 10, "blue_points": 10}
 {"type": "spawn_pack", "x": 303, "y": 621, "value": 1}
 {"type": "spawn_pack", "x": 554, "y": 270, "value": 1}
