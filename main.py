@@ -156,6 +156,11 @@ class Node:
         # 节点圆形
         _draw_aa_circle(surface, color, (cx, cy), NODE_RADIUS)
         _draw_aa_circle_outline(surface, WHITE, (cx, cy), NODE_RADIUS, 2)
+
+        # 根节点金色镶边
+        if self.parent is None:
+            _draw_aa_circle_outline(surface, (255, 215, 0), (cx, cy), NODE_RADIUS + 5, 3)
+
         # 强度数字
         txt = font_mid.render(str(self.strength), True, WHITE)
         rect = txt.get_rect(center=(cx, cy))
@@ -1537,7 +1542,7 @@ class Game:
             now = pygame.time.get_ticks()
             _sfx_debug_log[:] = [(f, t) for f, t in _sfx_debug_log if now - t < 2000]
             for i, (fname, _t) in enumerate(reversed(_sfx_debug_log)):
-                fnamee = fname.split('.')[0]
+                fnamee = fname.replace(fname.split('.')[-1], "")[:-1]
                 finaltext = f"[DEBUG] Sound #{i} - {fnamee}"
                 txt = font_tiny.render(finaltext, True, (random.randint(96, 255), random.randint(96, 255), random.randint(96, 255)))
                 surface.blit(txt, (10, SCREEN_HEIGHT - 20 - i * 16))

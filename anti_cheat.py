@@ -11,7 +11,7 @@ from constant import (
 
 
 # 最小相邻节点间距（平方值，避免开平方）
-NEAR_NODE_DIST_SQ = (NODE_RADIUS * 2 + 6) ** 2  # 42^2 = 1764
+NEAR_NODE_DIST_SQ = (NODE_RADIUS * 2 + 6) ** 2 - 200  # 42^2 = 1764
 
 
 class AntiCheat:
