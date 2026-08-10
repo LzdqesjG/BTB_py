@@ -410,6 +410,13 @@ class Game:
         # 回放选择
         self._replay_files = []
         self._replay_selected = 0
+        self._replay_row_rects = []        # 回放列表每行的矩形（鼠标点击用）
+        self._last_replay_click_time = 0   # 双击检测
+        self._last_replay_click_row = -1
+        self._replay_delete_mode = False   # 回放删除确认模式
+
+        # 自动吸附到当前范围边界（B 键开关）
+        self._snap_enabled = False
 
     def reset(self, game_info=None):
         Node._next_id = 0
@@ -869,6 +876,17 @@ class Game:
                 stack.append(ch)
         return out
 
+    def _collect_subtree_ids(self, root_node):
+        """收集以 root_node 为根的子树所有节点 id（含 root 自身），不修改状态。"""
+        out = set()
+        stack = [root_node]
+        while stack:
+            cur = stack.pop()
+            out.add(cur.id)
+            for ch in cur.children:
+                stack.append(ch)
+        return out
+
     def _remove_nodes(self, nodes_to_remove):
         """批量移除节点集合：从全局列表移除、从父节点 children 移除。"""
         if not nodes_to_remove:
@@ -983,6 +1001,202 @@ class Game:
                 weakened[victim.id] = victim.strength
 
         return removed_ids, None, weakened
+
+    def _preview_placement(self, mx, my):
+        """非破坏性预览：当前拖动状态下，在 (mx, my) 放置节点的效果。
+
+        复刻 _try_create_node + _resolve_crossing 的判定逻辑，但不修改任何游戏状态。
+
+        返回 dict：
+          placeable:    bool           是否可放置
+          reason:       str            不可放置的原因（'' 表示可放置）
+          hit_root:     bool           是否会穿透对方根节点（直接获胜）
+          hit_nodes:    [Node, ...]    被新树枝穿过的对方普通节点
+          hit_branches: [Node, ...]    被新树枝穿过的对方树枝的 child 端点
+          removed:      set[int]       会被删除的节点 id 集合（含子树）
+          weakened:     dict[int,int]  会被削弱但保留的节点 {id: 新强度}
+        """
+        node = self.drag_node
+        radius = self.temp_range_radius
+        strength = self.temp_strength
+        result = {
+            'placeable': False,
+            'reason': '',
+            'hit_root': False,
+            'hit_nodes': [],
+            'hit_branches': [],
+            'removed': set(),
+            'weakened': {},
+        }
+
+        if node is None:
+            return result
+        if not node.can_have_child():
+            result['reason'] = '该节点子节点已满'
+            return result
+        if self.has_created_this_turn:
+            result['reason'] = '本回合已创建过节点'
+            return result
+        if not self.can_afford():
+            result['reason'] = '点数不足'
+            return result
+        if not self._point_in_range(mx, my, node, radius):
+            result['reason'] = '超出范围'
+            return result
+        if (mx < NODE_RADIUS or mx > SCREEN_WIDTH - NODE_RADIUS
+                or my < 85 or my > SCREEN_HEIGHT - NODE_RADIUS):  # 避开顶部HUD
+            result['reason'] = '超出屏幕边界'
+            return result
+        for other in self.nodes:
+            dx = other.x - mx
+            dy = other.y - my
+            if dx * dx + dy * dy < (NODE_RADIUS * 2 + 4) ** 2:
+                result['reason'] = '与现有节点过近'
+                return result
+
+        result['placeable'] = True
+
+        # ===== 非破坏性切割预览（复刻 _resolve_crossing 判定逻辑） =====
+        attacker_team = self.current_team
+        p_new = (node.x, node.y)
+        q_new = (mx, my)
+
+        # 1. 穿过对方节点
+        hit_root = None
+        node_targets = []
+        for other in self.nodes:
+            if other.team == attacker_team:
+                continue
+            if other is node:
+                continue
+            if self._segment_intersects_circle(p_new, q_new,
+                                               (other.x, other.y), NODE_RADIUS):
+                if other.parent is None:
+                    hit_root = other
+                else:
+                    node_targets.append(other)
+
+        # 2. 穿过对方树枝
+        branch_targets = []
+        for child in self.nodes:
+            if child.team == attacker_team:
+                continue
+            if child.parent is None:
+                continue
+            parent = child.parent
+            p_old = (parent.x, parent.y)
+            q_old = (child.x, child.y)
+            # 共享端点检查（坐标比较，与 _resolve_crossing 一致）
+            share_endpoint = False
+            for a in (p_old, q_old):
+                for b in (p_new, q_new):
+                    if abs(a[0] - b[0]) < 1e-6 and abs(a[1] - b[1]) < 1e-6:
+                        share_endpoint = True
+                        break
+                if share_endpoint:
+                    break
+            if share_endpoint:
+                continue
+            if self._segments_intersect(p_new, q_new, p_old, q_old,
+                                        include_endpoints=False):
+                branch_targets.append(child)
+
+        result['hit_nodes'] = node_targets
+        result['hit_branches'] = branch_targets
+
+        if hit_root is not None:
+            result['hit_root'] = True
+            return result
+
+        # 3. 模拟结算（削弱/删除），不修改真实状态
+        removed = set()
+        weakened = {}
+        processed = set()
+        for victim in node_targets + branch_targets:
+            if victim.id in processed:
+                continue
+            if victim.id in removed:
+                continue  # 已被整棵子树删除
+            processed.add(victim.id)
+            new_str = victim.strength - strength
+            if new_str <= 0:
+                for sid in self._collect_subtree_ids(victim):
+                    removed.add(sid)
+            else:
+                weakened[victim.id] = new_str
+
+        result['removed'] = removed
+        result['weakened'] = weakened
+        return result
+
+    def _snap_to_range(self, mx, my):
+        """若启用自动吸附且鼠标超出当前范围圆，把坐标吸附到圆边界。"""
+        if not self._snap_enabled or self.drag_node is None:
+            return mx, my
+        node = self.drag_node
+        dx = mx - node.x
+        dy = my - node.y
+        dist = math.hypot(dx, dy)
+        r = self.temp_range_radius
+        if dist > r and dist > 1e-9:
+            return node.x + dx / dist * r, node.y + dy / dist * r
+        return mx, my
+
+    def _effective_drag_pos(self):
+        """拖动时实际生效的鼠标位置（考虑自动吸附）。"""
+        if self.dragging and self.drag_node is not None:
+            return self._snap_to_range(self.mouse_x, self.mouse_y)
+        return self.mouse_x, self.mouse_y
+
+    def _draw_cut_preview(self, surface, preview):
+        """绘制切割预览：被切断/削弱的对方节点与树枝。"""
+        removed = preview['removed']
+        weakened = preview['weakened']
+
+        # 1. 被切断的对方树枝（虚线高亮）
+        for child in preview['hit_branches']:
+            parent = child.parent
+            if parent is None:
+                continue
+            if child.id in removed:
+                col = (255, 60, 60, 220)
+                w = 3
+            elif child.id in weakened:
+                col = (255, 170, 60, 220)
+                w = 2
+            else:
+                continue
+            self._draw_dashed_line(surface, (parent.x, parent.y),
+                                   (child.x, child.y), col, dash_len=6, gap_len=4, width=w)
+
+        # 2. 被削弱的节点：橙色光圈
+        for nid in weakened:
+            n = self._node_by_id(nid)
+            if n is None:
+                continue
+            _draw_aa_circle_outline(surface, (255, 170, 60, 220),
+                                    (int(n.x), int(n.y)), NODE_RADIUS + 7, 3)
+
+        # 3. 会被删除的节点：红色光圈 + 叉号
+        for nid in removed:
+            n = self._node_by_id(nid)
+            if n is None:
+                continue
+            _draw_aa_circle_outline(surface, (255, 60, 60, 230),
+                                    (int(n.x), int(n.y)), NODE_RADIUS + 8, 3)
+            x, y = int(n.x), int(n.y)
+            r = NODE_RADIUS + 2
+            pygame.draw.line(surface, (255, 60, 60), (x - r, y - r), (x + r, y + r), 3)
+            pygame.draw.line(surface, (255, 60, 60), (x - r, y + r), (x + r, y - r), 3)
+
+        # 4. 命中根节点：金色光圈
+        if preview['hit_root']:
+            for root in self._get_roots():
+                if root.team != self.current_team:
+                    _draw_aa_circle_outline(surface, (255, 215, 0, 255),
+                                            (int(root.x), int(root.y)),
+                                            NODE_RADIUS + 10, 4)
+                    break
 
     @staticmethod
     def _point_in_range(px, py, node, radius):
@@ -1239,20 +1453,33 @@ class Game:
             surface.blit(glow_surf, (0, 0))
 
         # 拖动中的范围圆 + 预览连线和节点
+        preview = None
         if self.dragging and self.drag_node is not None:
             p = self.drag_node
-            # 范围限制圆
             radius = self.temp_range_radius
+            # 吸附后的实际鼠标位置
+            eff_mx, eff_my = self._effective_drag_pos()
             # 画虚线圆来表示范围
             self._draw_dashed_circle(surface, (int(p.x), int(p.y)), radius,
                                      TEAM_COLORS[self.current_team]['light'], 1)
+            # 吸附位置小标记（金色小圆点）
+            if self._snap_enabled:
+                pygame.draw.circle(surface, (255, 215, 0),
+                                   (int(eff_mx), int(eff_my)), 4, 1)
+            # 非破坏性预览：能否放置 + 会切断哪些对方节点
+            preview = self._preview_placement(eff_mx, eff_my)
+            placeable = preview['placeable']
+            hit_root = preview['hit_root']
             # 预览线
-            valid = self.can_afford()
-            in_range = self._point_in_range(self.mouse_x, self.mouse_y, p, radius)
-            line_color = GREEN if (valid and in_range) else (200, 50, 50)
+            if hit_root:
+                line_color = (255, 215, 0)  # 金色：必胜
+            elif placeable:
+                line_color = GREEN
+            else:
+                line_color = (200, 50, 50)
             pygame.draw.line(surface, line_color,
                              (int(p.x), int(p.y)),
-                             (int(self.mouse_x), int(self.mouse_y)), 2)
+                             (int(eff_mx), int(eff_my)), 2)
             # 预览节点（半透明）
             s = pygame.Surface((NODE_RADIUS * 2 + 4, NODE_RADIUS * 2 + 4), pygame.SRCALPHA)
             c = TEAM_COLORS[self.current_team]['main']
@@ -1261,7 +1488,7 @@ class Game:
             _draw_aa_circle_outline(s, WHITE, (NODE_RADIUS + 2, NODE_RADIUS + 2), NODE_RADIUS, 2)
             txt = font_mid.render(str(self.temp_strength), True, WHITE)
             s.blit(txt, txt.get_rect(center=(NODE_RADIUS + 2, NODE_RADIUS + 2)))
-            surface.blit(s, (int(self.mouse_x) - NODE_RADIUS - 2, int(self.mouse_y) - NODE_RADIUS - 2))
+            surface.blit(s, (int(eff_mx) - NODE_RADIUS - 2, int(eff_my) - NODE_RADIUS - 2))
 
         # 画点数包
         for pack in self.pickups:
@@ -1273,6 +1500,10 @@ class Game:
                           and node.can_have_child()
                           and not self.has_created_this_turn)
             node.draw(surface, emphasized=emphasized)
+
+        # 切割预览（在节点上方绘制，避免被遮挡）
+        if preview is not None:
+            self._draw_cut_preview(surface, preview)
 
         # 画得分弹出文字
         for popup in self.score_popups:
@@ -1355,20 +1586,23 @@ class Game:
         # 拖动时强度+范围提示
         if self.dragging:
             tip_y = 90
-            afford = self.can_afford()
-            in_range = self._point_in_range(self.mouse_x, self.mouse_y,
-                                            self.drag_node, self.temp_range_radius)
+            if preview is None:
+                eff_mx, eff_my = self._effective_drag_pos()
+                preview = self._preview_placement(eff_mx, eff_my)
+            placeable = preview['placeable']
+            reason = preview['reason']
+            snap_label = "开" if self._snap_enabled else "关"
             msg = (f"强度: {self.temp_strength}(-{self.strength_cost})  "
                    f"范围: {self.temp_range_radius}(-{self.range_cost})  "
-                   f"总消耗: {self.total_cost} 点  [空格切范围|滚轮调强度]")
-            c = GREEN if (afford and in_range) else (220, 80, 80)
+                   f"总消耗: {self.total_cost} 点  [空格切范围|滚轮调强度|B吸附:{snap_label}]")
+            c = GREEN if placeable else (220, 80, 80)
             ts = font_small.render(msg, True, c)
             surface.blit(ts, ts.get_rect(center=(SCREEN_WIDTH // 2, tip_y)))
             warn = []
-            if not afford:
-                warn.append("点数不足！")
-            if not in_range:
-                warn.append("超出范围！")
+            if reason:
+                warn.append(reason)
+            if preview['hit_root']:
+                warn.append("命中根节点 → 直接获胜！")
             if warn:
                 ts2 = font_tiny.render("  ".join(warn), True, (255, 100, 100))
                 surface.blit(ts2, ts2.get_rect(center=(SCREEN_WIDTH // 2, tip_y + 20)))
@@ -1390,13 +1624,15 @@ class Game:
         elif self.network_mode and self.current_team != self.my_team:
             hint = font_tiny.render("等待对方操作...", True, (200, 200, 100))
         elif self.dragging:
-            hint = font_tiny.render("滚轮调强度 | 空格切范围 | 松开鼠标创建节点", True, DARK_GRAY)
+            snap_label = "开" if self._snap_enabled else "关"
+            hint = font_tiny.render(f"滚轮调强度 | 空格切范围 | B吸附[{snap_label}] | 松开鼠标创建节点", True, DARK_GRAY)
         elif self.hovered_branch_child is not None:
             hint = font_tiny.render("右键进入树枝修改模式（仅可升级，不能降级）", True, (160, 220, 160))
         elif self.has_created_this_turn:
             hint = font_tiny.render("本回合已创建节点 | 右键树枝修改强度 | Tab/按钮 结束回合", True, (200, 200, 100))
         else:
-            hint = font_tiny.render("提示: 拖动己方节点创建分支 | 右键树枝进入修改 | 空格切范围 | Tab结束回合", True, DARK_GRAY)
+            snap_label = "开" if self._snap_enabled else "关"
+            hint = font_tiny.render(f"提示: 拖动己方节点创建分支 | 右键树枝进入修改 | 空格切范围 | B吸附[{snap_label}] | Tab结束回合", True, DARK_GRAY)
         surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 15)))
 
         # 树枝修改模式覆盖层
@@ -1736,6 +1972,11 @@ class Game:
         if event.type == pygame.MOUSEMOTION:
             self.mouse_x, self.mouse_y = event.pos
 
+        # B 键：切换自动吸附（全局，任意时机）
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
+            self._snap_enabled = not self._snap_enabled
+            play_sfx('click')
+
         if not is_my_turn:
             return  # 等待对方操作
 
@@ -1783,7 +2024,8 @@ class Game:
 
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             if self.dragging and self.drag_node is not None:
-                mx, my = event.pos
+                self.mouse_x, self.mouse_y = event.pos
+                mx, my = self._effective_drag_pos()
                 self._try_create_node(mx, my)
             self.dragging = False
             self.drag_node = None
@@ -2292,6 +2534,9 @@ class Game:
         title = font_big.render("选择回放文件", True, WHITE)
         surface.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 60)))
 
+        mouse_pos = pygame.mouse.get_pos()
+        self._replay_row_rects = []
+
         if not self._replay_files:
             hint = font_mid.render("暂无回放文件", True, GRAY)
             surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)))
@@ -2305,16 +2550,19 @@ class Game:
                 fname, steps, winner_label, mode_label = self._replay_files[idx]
                 y = list_start_y + i * 32
                 is_selected = (idx == self._replay_selected)
+                row = pygame.Rect(SCREEN_WIDTH // 2 - 300, y - 2, 600, 28)
+                self._replay_row_rects.append(row)
+                is_hover = row.collidepoint(mouse_pos)
 
-                # 选中高亮
+                # 选中/悬停高亮
                 if is_selected:
                     if self._replay_delete_mode:
-                        bar = pygame.Rect(SCREEN_WIDTH // 2 - 300, y - 2, 600, 28)
-                        pygame.draw.rect(surface, (150, 30, 30), bar, border_radius=4)
-                        pygame.draw.rect(surface, (255, 60, 60), bar, 2, border_radius=4)
+                        pygame.draw.rect(surface, (150, 30, 30), row, border_radius=4)
+                        pygame.draw.rect(surface, (255, 60, 60), row, 2, border_radius=4)
                     else:
-                        bar = pygame.Rect(SCREEN_WIDTH // 2 - 300, y - 2, 600, 28)
-                        pygame.draw.rect(surface, (50, 80, 150), bar, border_radius=4)
+                        pygame.draw.rect(surface, (50, 80, 150), row, border_radius=4)
+                elif is_hover:
+                    pygame.draw.rect(surface, (70, 70, 95), row, border_radius=4)
 
                 _offset = -4
 
@@ -2334,11 +2582,34 @@ class Game:
                 meta_rect = meta_txt.get_rect()
                 surface.blit(meta_txt, (SCREEN_WIDTH // 2 + 290 - meta_rect.width, y + _offset))
 
+        # 底部按钮：返回 / 删除
+        back_rect = pygame.Rect(SCREEN_WIDTH // 2 - 300, SCREEN_HEIGHT - 46, 90, 32)
+        h = back_rect.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, (60, 140, 160) if h else (35, 90, 110),
+                         back_rect, border_radius=6)
+        pygame.draw.rect(surface, WHITE, back_rect, 1, border_radius=6)
+        t = font_small.render("返回", True, WHITE)
+        surface.blit(t, t.get_rect(center=back_rect.center))
+        self._replay_sel_back_rect = back_rect
+
+        delete_label = "确认删除" if self._replay_delete_mode else "删除"
+        del_rect = pygame.Rect(SCREEN_WIDTH // 2 + 210, SCREEN_HEIGHT - 46, 90, 32)
+        h = del_rect.collidepoint(mouse_pos)
+        if self._replay_delete_mode:
+            dc = (200, 90, 40) if h else (150, 60, 30)
+        else:
+            dc = (180, 60, 60) if h else (120, 40, 40)
+        pygame.draw.rect(surface, dc, del_rect, border_radius=6)
+        pygame.draw.rect(surface, WHITE, del_rect, 1, border_radius=6)
+        t = font_small.render(delete_label, True, WHITE)
+        surface.blit(t, t.get_rect(center=del_rect.center))
+        self._replay_sel_delete_rect = del_rect
+
         # 底部提示
         if self._replay_delete_mode:
-            hint = font_tiny.render("↑↓ 选择   Tab 删除   Del / Esc 退出删除模式", True, (255, 80, 80))
+            hint = font_tiny.render("单击选择 / 点【确认删除】删除 | ↑↓ 选择  Tab 删除  Esc 退出", True, (255, 80, 80))
         else:
-            hint = font_tiny.render("↑↓ 选择   Enter 确认   Del 删除   Esc 返回", True, DARK_GRAY)
+            hint = font_tiny.render("单击选择 / 双击播放 | ↑↓ 选择  Enter 播放  Esc 返回", True, DARK_GRAY)
         surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 20)))
 
     def _handle_replay_select_event(self, event):
@@ -2353,18 +2624,8 @@ class Game:
                     self._replay_delete_mode = False
                     return
                 if event.key == pygame.K_TAB:
-                    if self._replay_files:
-                        fname = self._replay_files[self._replay_selected][0]
-                        src = os.path.join(os.path.dirname(__file__), 'replays', fname)
-                        del_dir = os.path.join(os.path.dirname(__file__), 'replays', 'deleted')
-                        os.makedirs(del_dir, exist_ok=True)
-                        dst = os.path.join(del_dir, fname)
-                        shutil.move(src, dst)
-                        del self._replay_files[self._replay_selected]
-                        play_sfx('shear')
-                        if self._replay_files:
-                            self._replay_selected = min(self._replay_selected, len(self._replay_files) - 1)
-                        return
+                    self._do_replay_delete()
+                    return
                 if event.key == pygame.K_ESCAPE:
                     self._replay_delete_mode = False
                     return
@@ -2398,6 +2659,57 @@ class Game:
                 delta = -1 if event.y > 0 else 1  # 上滚=上移=索引减
                 self._replay_selected = (self._replay_selected + delta) % n
                 play_sfx('click')
+
+        # 鼠标操作：单击选择 / 双击播放 / 按钮
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            mp = event.pos
+            # 返回按钮
+            if hasattr(self, '_replay_sel_back_rect') and self._replay_sel_back_rect.collidepoint(mp):
+                play_sfx('click')
+                self.state = STATE_MENU
+                return
+            # 删除按钮
+            if hasattr(self, '_replay_sel_delete_rect') and self._replay_sel_delete_rect.collidepoint(mp):
+                if not self._replay_files:
+                    return
+                play_sfx('click')
+                if self._replay_delete_mode:
+                    self._do_replay_delete()
+                else:
+                    self._replay_delete_mode = True
+                return
+            # 点击行：选择 / 双击开始播放
+            now = pygame.time.get_ticks()
+            for i, rect in enumerate(getattr(self, '_replay_row_rects', [])):
+                if rect.collidepoint(mp):
+                    if self._replay_selected != i:
+                        self._replay_selected = i
+                        play_sfx('click')
+                    # 双击播放（删除模式下禁用）
+                    if (not self._replay_delete_mode
+                            and now - getattr(self, '_last_replay_click_time', 0) < 500
+                            and getattr(self, '_last_replay_click_row', -1) == i):
+                        play_sfx('click')
+                        self._start_replay(self._replay_files[i][0])
+                    self._last_replay_click_time = now
+                    self._last_replay_click_row = i
+                    return
+            self._last_replay_click_time = 0
+
+    def _do_replay_delete(self):
+        """删除当前选中的回放文件（移入 deleted 目录）。"""
+        if not self._replay_files:
+            return
+        fname = self._replay_files[self._replay_selected][0]
+        src = os.path.join(os.path.dirname(__file__), 'replays', fname)
+        del_dir = os.path.join(os.path.dirname(__file__), 'replays', 'deleted')
+        os.makedirs(del_dir, exist_ok=True)
+        dst = os.path.join(del_dir, fname)
+        shutil.move(src, dst)
+        del self._replay_files[self._replay_selected]
+        play_sfx('shear')
+        if self._replay_files:
+            self._replay_selected = min(self._replay_selected, len(self._replay_files) - 1)
 
     def _start_replay(self, filename):
         """加载回放文件，分组为步骤，构建初始棋盘。"""
