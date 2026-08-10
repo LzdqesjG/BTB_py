@@ -16,11 +16,12 @@
 - [模块详解](#模块详解)
   - [main.py - 主游戏逻辑](#mainpy---主游戏逻辑)
   - [constant.py - 常量与配置](#constantpy---常量与配置)
+  - [config.json - 配置文件](#configjson---配置文件)
   - [network_protocol.py - 网络协议](#network_protocolpy---网络协议)
   - [game_server.py - 服务端](#game_serverpy---服务端)
   - [game_client.py - 客户端](#game_clientpy---客户端)
   - [anti_cheat.py - 反作弊](#anti_cheatpy---反作弊)
-  - [AI/aithink.py - AI 系统](#aiaithinkpy---ai-系统)
+  - [AI/aithink3.py - AI 系统](#aiaithink3py---ai-系统)
   - [replay.py - 回放系统](#replaypy---回放系统)
 - [联机架构](#联机架构)
   - [网络拓扑](#网络拓扑)
@@ -33,6 +34,8 @@
   - [增加新的网络消息](#增加新的网络消息)
   - [添加新的游戏状态](#添加新的游戏状态)
 - [调试模式](#调试模式)
+- [日志系统](#日志系统)
+- [CI/CD](#cicd)
 - [已知限制与改进方向](#已知限制与改进方向)
 - [许可协议](#许可协议)
 
@@ -89,7 +92,8 @@ python main.py
 ```
 BTB_py/
 ├── main.py                  # 游戏主入口、Node/Game 类、全量绘制和事件处理
-├── constant.py              # 全局常量、颜色、音效配置、字体加载
+├── constant.py              # 全局常量、颜色、音效配置、字体加载（从 config.json 读取）
+├── config.json              # 游戏基础配置（显示、玩法、AI 思考时间、点数包、端口）
 ├── network_protocol.py      # 网络消息编解码、状态序列化/反序列化
 ├── game_server.py           # 房主端 TCP 服务器（红方）
 ├── game_client.py           # 客户端 TCP 连接（蓝方）
@@ -99,15 +103,24 @@ BTB_py/
 ├── LICENCE                  # GPLv3 许可证全文
 ├── .gitignore               # Git 忽略规则
 ├── debug                    # 调试模式配置文件（存在即开启调试）
+├── logs/                    # 运行日志（按启动时间命名，如 20260810_143025a.log）
 │
 ├── assets/
 │   ├── sounds/              # OGG 音效文件（点击、切割、回合切换等）
 │   └── ai_default.json      # AI 默认参数（不可修改的初始版本）
 │
 ├── AI/
-│   ├── aithink.py           # AI 决策引擎
-│   ├── ai.json              # AI 运行时参数（为空时自动从 ai_default.json 复制）
-│   └── ai.json.bak          # AI 参数备份
+│   ├── aithink3.py          # AI 决策引擎（当前生效版本，main.py 导入此模块）
+│   ├── aithink2.py          # AI 旧版（早期移植版本）
+│   ├── aithink.py           # AI 旧版（最早移植版本）
+│   └── ai.json              # AI 运行时参数（为空时自动从 ai_default.json 复制）
+│
+├── dev/
+│   └── dev.md               # 本文档
+│
+├── .github/
+│   └── workflows/
+│       └── release-cd.yml   # GitHub Actions：打 tag 自动发布 ZIP Release
 │
 └── replays/                 # 对局回放文件（*.bpr, JSONL 格式）
 ```
@@ -116,16 +129,17 @@ BTB_py/
 
 | 文件 | 职责 | 依赖 |
 |------|------|------|
-| `main.py` | 游戏主入口；定义 `Node`、`PointPack`、`Game` 等核心类；处理全部 UI 渲染和事件 | `constant`, `replay`, `AI.aithink`(运行时按需) |
-| `constant.py` | 所有可配置常量、颜色、字体、音效路径 | 无（仅标准库） |
+| `main.py` | 游戏主入口；定义 `Node`、`PointPack`、`Game` 等核心类；处理全部 UI 渲染和事件 | `constant`, `replay`, `AI.aithink3` |
+| `constant.py` | 所有可配置常量、颜色、字体、音效路径；模块加载时读取 `config.json` | 标准库 `json/os` |
+| `config.json` | 游戏基础参数配置（AI 决策参数除外） | 被 `constant.py` 读取 |
 | `network_protocol.py` | 消息枚举、编解码、粘包处理、状态序列化 | `main`（通过 `resolve_module_class` 动态引用） |
 | `game_server.py` | TCP 监听、蓝队动作接收、广播状态 | `network_protocol`, `anti_cheat` |
 | `game_client.py` | TCP 连接、状态接收、操作发送 | `network_protocol` |
-| `anti_cheat.py` | 服务端验证：回合、坐标、点数、频率 | `constant` |
+| `anti_cheat.py` | 服务端验证：回合、坐标、点数、频率、禁止降级 | `constant` |
 | `replay.py` | JSONL 格式对局记录、保存到 `replays/` | 无（仅标准库） |
-| `AI/aithink.py` | 多策略 AI 决策引擎 | `constant`, `assets/ai_default.json` |
-| `AI/ai.json` | AI 运行时参数（可热修改） | 被 `aithink.py` 读取 |
-| `assets/ai_default.json` | AI 默认参数模板 | 被 `aithink.py` 复制 |
+| `AI/aithink3.py` | 多策略 AI 决策引擎（当前生效） | `constant`, `assets/ai_default.json` |
+| `AI/ai.json` | AI 运行时参数（可热修改） | 被 `aithink3.py` 读取 |
+| `assets/ai_default.json` | AI 默认参数模板 | 被 `aithink3.py` 复制 |
 
 ***
 
@@ -169,7 +183,12 @@ Game (游戏主状态)
 │
 ├── AI 相关
 │   ├── _ai_mode: bool
-│   └── _ai_team: 'RED'|'BLUE'
+│   ├── _ai_team: 'RED'|'BLUE'
+│   ├── _ai_think_timer: int          # AI 思考计时器（帧）
+│   ├── _AI_THINK_DELAY: int          # AI 思考延迟（从 config.json 读取，默认 90 帧）
+│   ├── _ai_memory: dict              # AI 跨回合记忆（落点记忆/强化计数）
+│   ├── _ai_post_reinforce: int       # 本回合放置后已强化次数（最多 2 次）
+│   └── _ai_debug_candidates: list    # AI 候选可视化数据（已注释停用）
 │
 ├── 交互状态
 │   ├── dragging: bool        # 是否正在拖拽
@@ -177,7 +196,13 @@ Game (游戏主状态)
 │   ├── temp_strength: int    # 拖拽时的临时强度
 │   ├── temp_range_index: int # 拖拽时的临时范围索引
 │   ├── has_created_this_turn: bool  # 本回合是否已创建节点
-│   └── hovered_branch_child: Node|None  # 鼠标悬停的树枝
+│   ├── hovered_branch_child: Node|None  # 鼠标悬停的树枝
+│   │
+│   ├── 树枝修改模式（右键进入）
+│   │   ├── _branch_modify_mode: bool
+│   │   ├── _branch_modify_target: Node|None
+│   │   └── _branch_modify_strength: int   # UI 中暂定的新强度（只能 > 原强度）
+│   └── _idle_played_key: tuple|None   # 已播放过回合 idle 音效的标识
 │
 └── replay: ReplayRecorder    # 回放记录器
 ```
@@ -235,10 +260,11 @@ while True:
 
 | 类 | 行数 | 说明 |
 |----|------|------|
-| `Node` | L197-L243 | 树节点，含渲染、点击检测 |
-| `PointPack` | L246-L288 | 点数包，含出生动画 |
-| `ScorePopup` | L291-L313 | 拾取得分浮动文字 |
-| `Game` | L316-L2594 | **核心类**，包含全部游戏逻辑 |
+| `Node` | L229-L277 | 树节点，含渲染、点击检测 |
+| `PointPack` | L278-L322 | 点数包，含出生动画 |
+| `ScorePopup` | L323-L347 | 拾取得分浮动文字 |
+| `Game` | L348-L2815 | **核心类**，包含全部游戏逻辑 |
+| `main()` | L2817+ | 程序入口，主循环 |
 
 **`Game` 类的方法分组**：
 
@@ -250,7 +276,9 @@ while True:
 | 节点操作 | `_try_create_node()`, `_remove_nodes()`, `_collect_subtree()` | 创建/删除/收集子树 |
 | 点数包 | `_spawn_pickup()`, `_init_pickups()`, `_check_pickup_collisions()` | 生成/初始化/碰撞检测 |
 | 交互 | `_update_hovered_branch()`, `_handle_wheel()` | 树枝悬停检测/滚轮处理 |
-| AI | `_ai_update()` | AI 回合操作 |
+| 树枝修改 | `_enter_branch_modify()`, `_handle_branch_modify_event()`, `_adjust_branch_modify_strength()`, `_confirm_branch_modify()`, `_draw_branch_modify_overlay()` | 右键修改模式：进入/事件/调强度/确认/绘制 |
+| 音效 | `update()` 中 idle 检测 | 己方回合开始时播放随机 idle 音调（`_idle_played_key` 去重） |
+| AI | `_ai_update()` | AI 回合操作（含放置后强化） |
 | 渲染 | `draw_menu()`, `draw_playing()`, `draw_game_over()` 等 | 各状态界面绘制 |
 | 事件 | `handle_event()`, `_handle_menu_event()`, `_handle_playing_event()` 等 | 按状态分发事件 |
 | 回放 | `_start_replay()`, `_replay_step_forward()` 等 | 回放播放与控制 |
@@ -262,18 +290,37 @@ while True:
 
 ### constant.py - 常量与配置
 
-所有可调参数集中在此文件，开发者可以通过修改常量来调整游戏平衡：
+所有可调参数集中在此文件，开发者可以通过修改常量来调整游戏平衡。**大部分值可在模块加载时被 `config.json` 覆盖**（`_load_config()` + `_config.get(...)` 模式）：
 
-- `VERSION`：版本号字符串
-- `SCREEN_WIDTH/HEIGHT`：窗口尺寸（1300×700）
+- `_load_config()`：读取项目根目录 `config.json`，不存在则返回空 dict（全部使用默认值）
+- `SCREEN_WIDTH/HEIGHT`：窗口尺寸（1300×700，可配置）
+- `FPS`：帧率（60，可配置）
 - `NODE_RADIUS`：节点圆形半径（18px）
-- `INITIAL_POINTS`：初始点数（10）
-- `MIN_STRENGTH/MAX_STRENGTH`：强度范围（1~5）
-- `MAX_CHILDREN`：每个节点最大子节点数（2）
+- `INITIAL_POINTS`：初始点数（10，可配置）
+- `MIN_STRENGTH/MAX_STRENGTH`：强度范围（1~5，可配置）
+- `MAX_CHILDREN`：每个节点最大子节点数（2，可配置）
 - `RANGE_OPTIONS`：可选范围半径列表 `[120, 160, 200, 240]`
-- `PICKUP_VALUES`：点数包分值列表 `[1, 2, 3]`
+- `AI_THINK_DELAY`：AI 思考延迟帧数（90，可配置）
+- `PICKUP_VALUES`：点数包分值列表 `[1, 2, 3]`（可配置）
+- `DEFAULT_PORT`：联机默认端口（8447，可配置）
 - `FONT_CANDIDATES`：跨平台字体候选路径（Windows/macOS/Linux/Android）
 - `SOUND_DIR` 和音效映射：所有音效文件的对应关系
+
+### config.json - 配置文件
+
+位于项目根目录，格式：
+
+```json
+{
+  "display":  { "width": 1300, "height": 700, "fps": 60 },
+  "gameplay": { "initial_points": 10, "min_strength": 1, "max_strength": 5, "max_children": 2 },
+  "ai":       { "think_delay_frames": 90 },
+  "pickup":   { "radius": 13, "min_root_distance": 160, "values": [1, 2, 3] },
+  "network":  { "default_port": 8447 }
+}
+```
+
+> **注意**：`config.json` 只控制**基础游戏参数**。AI 决策评分参数在 `AI/ai.json`（由 `aithink3.py` 读取），两者互不干扰。
 
 ### network_protocol.py - 网络协议
 
@@ -339,27 +386,29 @@ while True:
 | 父节点合法性 | 必须是蓝队节点、有子节点名额 |
 | 范围限制 | 新节点必须在父节点的范围圈内 |
 | 点数校验 | 总消耗必须不超过蓝队当前点数 |
+| **禁止降级** | `check_modify_branch` 校验 `target_strength >= target.strength`，客户端请求降级直接拒绝 |
 | 频率限制 | 每秒不超过 10 个动作 |
 
 累计违规超过阈值可触发踢出（目前计数值保留，踢出逻辑预留）。
 
-### AI/aithink.py - AI 系统
+### AI/aithink3.py - AI 系统
+
+**当前生效版本**：`main.py` 顶部 `from AI.aithink3 import AIThinker`。同目录的 `aithink.py` 和 `aithink2.py` 是早期移植版本（结构类似，但缺少后续增强功能），仅供对比参考。
 
 **入口**：`AIThinker(game).decide_action()` → 返回动作字典或 `None`。
 
-**决策优先级**（从高到低）：
+**决策流程**（从高到低）：
 
 ```
 1. 根危预检：敌方接近己方根时跳过拾取和扩张
-2. 强制拾取点数包（不危时）
-3. 尝试穿过敌方根（致命一击）
-4. 主动切割附近敌方节点
-5. 警戒区拦截（敌方进入预设区域）
-6. 根节点紧急防御
-7. 调节树枝强度（概率触发）
-8. 常规候选评分 → 加权随机选择
-9. 绝望模式：放宽间距限制强制放置
-10. 结束回合
+2. 局面动态分析（analyze_situation）—— 根据节点/边/点数/威胁走廊/半场控制调整权重
+3. 候选目标生成（gen_targets）—— 朝敌根推进、侧翼、切敌节点、切边、收集、环形扫描
+4. 强制杀根检测（find_kill_move）—— 预算内一步穿过敌根 → 直接取胜
+5. 多维度静态评分（score_target）+ 威胁惩罚（threat_penalty）
+6. 轻量前向模拟（simulate_lookahead）—— 对 top 候选做"我落子→敌回应→我再回应"的贪心推演
+7. 加权随机选择 → 执行
+8. 薄弱边强化（choose_reinforce）
+9. 结束回合
 ```
 
 **评分系统**（`_score()`）：
@@ -372,11 +421,18 @@ while True:
      + 随机噪声
 ```
 
+**AI 增强特性**：
+- **放置后强化**：AI 放置节点后调用 `choose_reinforce()` 优先加固威胁走廊内的低强度边，每回合最多 2 次（由 `Game._ai_post_reinforce` 控制，见 `main.py _ai_update()`）
+- **记忆**：上次落点被摧毁的位置不再重建（`_ai_memory`，每局 `reset()` 时清空）
+- **前向模拟**：对候选做 2 层贪心推演修正静态分
+- **思考延迟**：由 `config.json` 的 `ai.think_delay_frames` 控制（默认 90 帧 ≈ 1.5s），`main.py` 中 `_AI_THINK_DELAY = AI_THINK_DELAY`
+
 **可配置参数**：全部通过 `assets/ai_default.json` 配置，运行时从 `AI/ai.json` 加载。修改 `ai.json` 后无需重启游戏即可生效（每局初始化时重新读取）。
 
 相关文件：
 - `AI/ai.json`：运行时配置，为空时自动从 `ai_default.json` 复制
 - `assets/ai_default.json`：出厂默认配置，含每个参数的注释说明
+- `AI/aithink.py` / `AI/aithink2.py`：早期版本（未被 main.py 引用）
 
 ### replay.py - 回放系统
 
@@ -397,7 +453,7 @@ while True:
 | `end_turn` | `team` | 结束回合 |
 | `game_over` | `winner` | 游戏结束 |
 
-**保存时机**：`Game.update()` 检测到 `STATE_GAME_OVER` 时调用 `replay.save()`，只保存一次（`_saved` 标志防重复）。
+**保存时机**：`Game.update()` 检测到 `STATE_GAME_OVER` 时调用 `replay.save()`，只保存一次（`_saved` 标志防重复）。**联机客户端（蓝队）不保存回放**——服务端是权威记录端，客户端只生成空文件。
 
 **回放控制**：支持步进（←/→）、自动播放（空格）、进入残局（"进入游戏"按钮，可从任意步骤开始继续战斗）。
 
@@ -492,7 +548,7 @@ Client                           Server
 
 ### 添加新游戏机制
 
-1. **新增常量** → 在 `constant.py` 中添加
+1. **新增常量** → 在 `constant.py` 中添加（如需用户可调，同时在 `config.json` 中新增配置项并回退默认值）
 2. **新增状态字段** → 在 `Game.__init__()` 中添加，`Game.reset()` 中重置
 3. **新增渲染** → 在 `Game.draw_playing()` 中添加绘制逻辑
 4. **新增事件** → 在 `Game._handle_playing_event()` 中添加处理
@@ -500,12 +556,22 @@ Client                           Server
 6. **反作弊** → 在 `anti_cheat.py` 中添加对应的校验方法
 7. **回放** → 在 `replay.py` 中使用 `game.replay.record()` 记录，在 `_apply_replay_action()` 中添加应用逻辑
 
+### 添加可配置项（config.json）
+
+如果新参数希望用户能调整：
+
+1. 在 `config.json` 对应分组中添加字段
+2. 在 `constant.py` 中用 `_config.get('分组', {}).get('字段', 默认值)` 读取（**必须提供默认值**，保证 config 缺失时向后兼容）
+3. 游戏内通过 `from constant import *` 使用即可
+
 ### 修改 AI 行为
 
 1. **快速调参**：直接修改 `AI/ai.json`，下次 AI 对局即生效
-2. **修改策略**：在 `AI/aithink.py` 中修改 `decide_action()` 的决策优先级或添加新规则
-3. **修改评分**：在 `_score()` 中添加新的评分维度
-4. **添加参数**：在 `ai_default.json` 中添加新参数（含 `_note` 注释），在 `AIThinker.__init__()` 中读取
+2. **修改思考速度**：修改 `config.json` 的 `ai.think_delay_frames`（不影响 AI 决策质量，只改变"思考"耗时）
+3. **修改策略**：在 `AI/aithink3.py` 中修改 `decide_action()` 的决策优先级或添加新规则
+4. **修改评分**：在 `score_target()` / `threat_penalty()` 中添加新的评分维度
+5. **添加参数**：在 `assets/ai_default.json` 中添加新参数（含 `_note` 注释），在 `AIThinker.__init__()` 中读取
+6. **切换 AI 版本**：把 `main.py` 顶部的 `from AI.aithink3 import AIThinker` 改为引用旧版模块（不推荐，仅回退时使用）
 
 ### 增加新的网络消息
 
@@ -558,6 +624,62 @@ if "YOUR_FLAG" in DEBUGS:
 
 ***
 
+## 日志系统
+
+`main.py` 在启动时初始化 `logging`，同时输出到控制台和文件。
+
+### 初始化流程（main.py 顶部）
+
+1. `logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(message)s")` → 控制台简版格式
+2. 在 `logs/` 目录创建日志文件：`logs/YYYYmmdd_HHMMssa.log`（启动时间 + 后缀）
+3. 重名时后缀自动递增 `b`、`c`、`d`...，直到不重名
+4. `FileHandler` 使用文件格式 `[%(asctime)s %(levelname)s] %(message)s`（含完整时间戳）
+5. **`print()` 被重定向**：全局 `print()` 被替换为 `log.info()`，所有原有 `print()` 调用自动写入日志
+
+### 使用方式
+
+```python
+log.debug("详细调试信息")
+log.info("常规信息")     # 等价于 print()
+print("也会进入日志文件")  # print 已被重定向
+```
+
+### 日志文件
+
+- 路径：`logs/`
+- 文件名示例：`20260810_143025a.log`、`20260810_143025b.log`
+- `.gitignore` 已忽略 `*.log`，日志不会进入版本库
+
+***
+
+## CI/CD
+
+`.github/workflows/release-cd.yml`：打 tag 时自动构建 Release。
+
+### 触发方式
+
+- push 带 `v*` 前缀的 tag（如 `v1.5`）
+- 手动触发（`workflow_dispatch`）
+
+### 版本号约定
+
+| Tag | Release 类型 |
+|-----|-------------|
+| `v1.5` | 正式版 |
+| `v1.5-p-r` | 预发布版（pre-release） |
+
+### 流程
+
+1. `actions/checkout@v4` 拉取代码
+2. 解析 tag → 提取版本号、判断是否 pre-release
+3. 提取最后一次 commit message 作为 Release body
+4. `zip` 打包源码（排除 `.git`、`.github`）→ `project-<版本>.zip`
+5. `softprops/action-gh-release@v2` 创建 Release 并上传 ZIP
+
+> 注意：打包包含 `logs/`（已被 .gitignore 忽略，不在 git 中所以不会被打包）和 `replays/`。发布前确认仓库中没有残留的临时文件。
+
+***
+
 ## 已知限制与改进方向
 
 | 限制 | 说明 | 改进方向 |
@@ -565,7 +687,7 @@ if "YOUR_FLAG" in DEBUGS:
 | 单客户端 | 服务端仅支持一个客户端连接 | 增加房间列表，支持多房间 |
 | TCP 协议 | 文本协议简单但扩展性有限 | 考虑迁移到二进制协议或使用现成的消息库 |
 | 无认证 | 客户端无需认证即可连接 | 添加简易密码或 token 认证 |
-| 音效硬编码 | 音效文件路径和映射全部在 constant.py 中 | 可使用配置文件管理 |
+| 音效硬编码 | 音效文件路径和映射全部在 constant.py 中 | 可迁移到 config.json 或独立音效配置 |
 | AI 单模型 | AI 固定使用一套参数 | 增加多难度等级或多套参数预设 |
 | 设置按钮预留 | 菜单上"设置"按钮尚无功能 | 可添加音量、全屏、键位等设置 |
 

@@ -1,23 +1,41 @@
 """游戏常量与字体配置。"""
+import json
 import os
 import sys
 
 VERSION = "v1.5"
 AUTHOR = "Lzdqesj"
 
-SCREEN_WIDTH, SCREEN_HEIGHT = 1300, 700
-FPS = 60
+
+def _load_config():
+    """从 config.json 加载配置，不存在则返回空 dict。"""
+    _cfg_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    if os.path.isfile(_cfg_path):
+        with open(_cfg_path, 'r', encoding='utf-8') as _f:
+            return json.load(_f)
+    return {}
+
+_config = _load_config()
+
+# ===== 显示 =====
+SCREEN_WIDTH = _config.get('display', {}).get('width', 1300)
+SCREEN_HEIGHT = _config.get('display', {}).get('height', 700)
+FPS = _config.get('display', {}).get('fps', 60)
+
 NODE_RADIUS = 18
-INITIAL_POINTS = 10
-MIN_STRENGTH = 1
-MAX_STRENGTH = 5
-MAX_CHILDREN = 2
+INITIAL_POINTS = _config.get('gameplay', {}).get('initial_points', 10)
+MIN_STRENGTH = _config.get('gameplay', {}).get('min_strength', 1)
+MAX_STRENGTH = _config.get('gameplay', {}).get('max_strength', 5)
+MAX_CHILDREN = _config.get('gameplay', {}).get('max_children', 2)
 RANGE_OPTIONS = [120, 160, 200, 240]  # 可选范围半径，空格循环切换
 
+# AI
+AI_THINK_DELAY = _config.get('ai', {}).get('think_delay_frames', 90)
+
 # 点数包常量
-PICKUP_RADIUS = 13
-PICKUP_MIN_ROOT_DIST = 160
-PICKUP_VALUES = [1, 2, 3]
+PICKUP_RADIUS = _config.get('pickup', {}).get('radius', 13)
+PICKUP_MIN_ROOT_DIST = _config.get('pickup', {}).get('min_root_distance', 160)
+PICKUP_VALUES = _config.get('pickup', {}).get('values', [1, 2, 3])
 PICKUP_COLORS = {
     1: (255, 215, 0),    # 金色
     2: (255, 165, 30),   # 橙色
@@ -56,7 +74,7 @@ STATE_JOIN_INPUT = 'join_input'    # 客户端输入IP
 STATE_CONNECTING = 'connecting'    # 客户端连接中
 STATE_REPLAY_SELECT = 'replay_select'  # 回放文件选择
 STATE_REPLAY_PLAY = 'replay_play'      # 回放播放中
-DEFAULT_PORT = 8447
+DEFAULT_PORT = _config.get('network', {}).get('default_port', 8447)
 
 # ===== 音效配置 =====
 SOUND_DIR = os.path.join(os.path.dirname(__file__), 'assets', 'sounds')
