@@ -655,10 +655,11 @@ class Game:
             return
 
         if self.state == STATE_GAME_OVER:
-            fname = self.replay.save()
-            if fname:
-                add_debug_log(f"[DEBUG] Replay saved: {fname}", (-1, -1, -1), 3000)
-            
+            # 客户端不保存回放（服务端已有权威回放）
+            if self.network_mode != 'client':
+                fname = self.replay.save()
+                if fname:
+                    add_debug_log(f"[DEBUG] Replay saved: {fname}", (-1, -1, -1), 3000)
             return
 
         if self.state == STATE_REPLAY_PLAY:

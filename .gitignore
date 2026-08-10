@@ -16,3 +16,6 @@ tests/
 # Replay files
 replay/*
 *.bpr
+
+# ???
+mianer.py
