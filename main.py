@@ -842,28 +842,28 @@ class Game:
         dist_sq = (closest_x - cx) ** 2 + (closest_y - cy) ** 2
         return dist_sq <= radius * radius
 
-    # ===== AI 候选可视化（已注释） =====
-    # @staticmethod
-    # def _draw_dashed_line(surface, p1, p2, color, dash_len=8, gap_len=6, width=1):
-    #     """绘制虚线。color 支持 RGBA 元组（含透明度）。"""
-    #     x1, y1 = p1
-    #     x2, y2 = p2
-    #     dx, dy = x2 - x1, y2 - y1
-    #     total = math.hypot(dx, dy)
-    #     if total < 1:
-    #         return
-    #     ux, uy = dx / total, dy / total
-    #     seg = dash_len + gap_len
-    #     drawn = 0.0
-    #     while drawn < total:
-    #         start_x = x1 + ux * drawn
-    #         start_y = y1 + uy * drawn
-    #         end = min(dash_len, total - drawn)
-    #         end_x = x1 + ux * (drawn + end)
-    #         end_y = y1 + uy * (drawn + end)
-    #         pygame.draw.line(surface, color, (int(start_x), int(start_y)),
-    #                          (int(end_x), int(end_y)), width)
-    #         drawn += seg
+    @staticmethod
+    def _draw_dashed_line(surface, p1, p2, color, dash_len=8, gap_len=6, width=1):
+        """绘制虚线。color 支持 RGBA 元组（含透明度）。
+        用于切割预览高亮，也供 AI 候选可视化复用。"""
+        x1, y1 = p1
+        x2, y2 = p2
+        dx, dy = x2 - x1, y2 - y1
+        total = math.hypot(dx, dy)
+        if total < 1:
+            return
+        ux, uy = dx / total, dy / total
+        seg = dash_len + gap_len
+        drawn = 0.0
+        while drawn < total:
+            start_x = x1 + ux * drawn
+            start_y = y1 + uy * drawn
+            end = min(dash_len, total - drawn)
+            end_x = x1 + ux * (drawn + end)
+            end_y = y1 + uy * (drawn + end)
+            pygame.draw.line(surface, color, (int(start_x), int(start_y)),
+                             (int(end_x), int(end_y)), width)
+            drawn += seg
 
     def _collect_subtree(self, root_node):
         """收集以 root_node 为根的所有后代节点（含 root_node 自己）。"""
