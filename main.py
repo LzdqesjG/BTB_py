@@ -418,6 +418,9 @@ class Game:
         # 自动吸附到当前范围边界（B 键开关）
         self._snap_enabled = False
 
+        # 回放进度条拖动状态
+        self._replay_progress_dragging = False
+
     def reset(self, game_info=None):
         Node._next_id = 0
         self.nodes = []
@@ -2787,6 +2790,7 @@ class Game:
         self._replay_step_index = -1
         self._replay_playing = False
         self._replay_timer = 0
+        self._replay_progress_dragging = False
 
         # 构建初始状态（只有根节点，无任何操作）
         Node._next_id = 100000
@@ -2894,6 +2898,27 @@ class Game:
     def _is_replay_first_step(self):
         return self._replay_step_index < 0
 
+    def _replay_seek(self, ratio):
+        """拖动进度条：按比例 (0.0~1.0) 跳到对应步骤，并重建局面。"""
+        total = len(self._replay_steps)
+        if total <= 0:
+            return
+        # 进度条 0 → 初始步骤(-1)，1 → 最后一步(len-1)
+        target = max(-1, min(total - 1, int(round(ratio * total)) - 1))
+        if target == self._replay_step_index:
+            return
+        self._replay_step_index = target
+        self._rebuild_replay_state()
+
+    def _replay_seek_from_x(self, mx):
+        """把鼠标 x 坐标映射为进度条比例并跳转。"""
+        rect = getattr(self, '_replay_progress_rect', None)
+        if rect is None or rect.width <= 0:
+            return
+        ratio = (mx - rect.x) / rect.width
+        ratio = max(0.0, min(1.0, ratio))
+        self._replay_seek(ratio)
+
     def draw_replay_play(self, surface):
         """回放播放界面。"""
         surface.fill(BG_COLOR)
@@ -2983,12 +3008,37 @@ class Game:
                                             can_enter,
                                             (160, 120, 20))
 
-        # 胜利提示（按钮下方，避免遮挡）
+        # 可拖动进度条（顶部居中，位于控制按钮下方）
+        bar_w, bar_h = 700, 10
+        bar_x = (SCREEN_WIDTH - bar_w) // 2
+        bar_y = btn_y + btn_h + 16
+        if total_steps > 0:
+            progress = (self._replay_step_index + 1) / total_steps
+        else:
+            progress = 0.0
+        progress = max(0.0, min(1.0, progress))
+        self._replay_progress_rect = pygame.Rect(bar_x, bar_y, bar_w, bar_h)
+        # 轨道
+        pygame.draw.rect(surface, (60, 60, 80), self._replay_progress_rect, border_radius=5)
+        pygame.draw.rect(surface, WHITE, self._replay_progress_rect, 1, border_radius=5)
+        # 已播放部分
+        fill_w = int(bar_w * progress)
+        if fill_w > 0:
+            pygame.draw.rect(surface, (90, 150, 230), (bar_x, bar_y, fill_w, bar_h),
+                             border_radius=5)
+        # 滑块圆点
+        handle_x = bar_x + fill_w
+        pygame.draw.circle(surface, (200, 225, 255), (handle_x, bar_y + bar_h // 2), 8)
+        # 拖动时高亮滑块
+        if self._replay_progress_dragging:
+            pygame.draw.circle(surface, (255, 230, 150), (handle_x, bar_y + bar_h // 2), 10, 2)
+
+        # 胜利提示（进度条下方，避免遮挡）
         if self.winner:
             wcolor = TEAM_COLORS[self.winner]['main']
             winner_name = self._team_label(self.winner)
             wtxt = font_mid.render(f"{winner_name} 获胜", True, wcolor)
-            surface.blit(wtxt, wtxt.get_rect(center=(SCREEN_WIDTH // 2, btn_y + btn_h + 18)))
+            surface.blit(wtxt, wtxt.get_rect(center=(SCREEN_WIDTH // 2, bar_y + bar_h + 18)))
 
         # 返回按钮
         back_rect = pygame.Rect(SCREEN_WIDTH - 120, SCREEN_HEIGHT - 50, 100, 34)
@@ -3051,6 +3101,15 @@ class Game:
             sys.exit()
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mp = event.pos
+            # 点击/按下进度条：暂停自动播放并开始拖动跳转
+            if (not getattr(self, '_resume_menu', False)
+                    and hasattr(self, '_replay_progress_rect')
+                    and self._replay_progress_rect.inflate(0, 12).collidepoint(mp)):
+                self._replay_progress_dragging = True
+                self._replay_playing = False
+                self._replay_timer = 0
+                self._replay_seek_from_x(mp[0])
+                return
             if hasattr(self, '_replay_back_rect') and self._replay_back_rect.collidepoint(mp):
                 play_sfx('click')
                 self.go_menu()
@@ -3072,6 +3131,12 @@ class Game:
                     self._resume_menu = True
                     self._resume_buttons = []
                     self._resume_rects = {}
+        # 拖动进度条：跟随鼠标移动跳转
+        if event.type == pygame.MOUSEMOTION and self._replay_progress_dragging:
+            self._replay_seek_from_x(event.pos[0])
+        # 松开鼠标结束拖动
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._replay_progress_dragging = False
         # 残局模式子菜单
         if getattr(self, '_resume_menu', False) and event.type == pygame.MOUSEBUTTONDOWN:
             mp = pygame.mouse.get_pos()
