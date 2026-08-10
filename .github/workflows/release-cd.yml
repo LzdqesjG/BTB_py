@@ -14,8 +14,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Parse tag info
         id: tag_info
@@ -51,7 +49,7 @@ jobs:
             -x ".github/*"
 
       - name: Create Release and upload asset
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           name: "${{ steps.tag_info.outputs.version }}"
           body: ${{ steps.commit_msg.outputs.body }}
