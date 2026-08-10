@@ -3,17 +3,17 @@ name: Create Release ZIP
 on:
   push:
     tags:
-      - 'v*'                # 只响应 v 开头的标签
-  workflow_dispatch:        # 允许手动触发（方便测试）
+      - 'v*'
+  workflow_dispatch:
 
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write       # 必须，用于创建 Release 和上传附件
+      contents: write
 
     steps:
-      # 1. 检出代码（含子模块）
+      # 1. 检出代码（含所有子模块）
       - name: Checkout code
         uses: actions/checkout@v4
         with:
@@ -23,19 +23,15 @@ jobs:
       - name: Parse tag info
         id: tag_info
         run: |
-          set -euo pipefail   # 管道安全：任何命令失败则退出
-          
+          set -euo pipefail
           TAG="${{ github.ref_name }}"          # 例如 v1.0.1-p-r
-          VERSION="${TAG#v}"                   # 去掉前缀 v → 1.0.1-p-r
-          
+          VERSION="${TAG#v}"                   # 去掉 v → 1.0.1-p-r
           if [[ "$VERSION" == *-p-r ]]; then
             PRERELEASE="true"
             VERSION="${VERSION%-p-r}"          # 去掉 -p-r → 1.0.1
           else
             PRERELEASE="false"
           fi
-          
-          # 设置输出变量，供后续步骤使用
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
 
@@ -44,29 +40,28 @@ jobs:
         id: commit_msg
         run: |
           set -euo pipefail
-          
-          # 获取完整提交信息（标题 + 正文）
           MSG=$(git log -1 --pretty=format:%B)
-          
-          # 使用 Heredoc 安全写入多行文本（保留换行和特殊字符）
           echo "body<<EOF" >> $GITHUB_OUTPUT
           echo "$MSG" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      # 4. 创建 Release 并打包源代码（含子模块）
-      - name: Create recursive source ZIP
-        uses: espressif/release-zips-action@v1
+      # 4. 打包整个项目（含子模块）为 tar.gz
+      - name: Create source tarball
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.tag_info.outputs.version }}"
+          tar -czf "project-${VERSION}.tar.gz" \
+            --exclude=.git \
+            --exclude=.github \
+            .
+
+      # 5. 创建 Release 并上传压缩包（完全自定义）
+      - name: Create Release and upload asset
+        uses: softprops/action-gh-release@v1
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          
-          # 版本号 = 解析后的纯净版本（不带 v 和 -p-r）
-          release_name: "${{ steps.tag_info.outputs.version }}"
-          
-          # 描述 = 完整的 Commit 信息
-          release_body: ${{ steps.commit_msg.outputs.body }}
-          
-          # 预发布标志 = 根据标签结尾判断
-          release_prerelease: ${{ steps.tag_info.outputs.prerelease }}
-          
-          # 直接发布，不保存为草稿（可改为 true 如果你需要）
-          release_draft: false
+          name: "${{ steps.tag_info.outputs.version }}"          # Release 标题
+          body: ${{ steps.commit_msg.outputs.body }}             # 描述
+          prerelease: ${{ steps.tag_info.outputs.prerelease }}   # 预发布标志
+          draft: false                                           # 直接发布（或设为 true 保留草稿）
+          files: project-*.tar.gz                                # 上传压缩包
+          token: ${{ secrets.GITHUB_TOKEN }}                     # 自动注入，无需手动配置
