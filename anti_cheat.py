@@ -139,7 +139,12 @@ class AntiCheat:
             return self._violation(
                 f"目标节点不存在或不是蓝队子节点: ({node_x},{node_y})")
 
-        # 4. 点数检查
+        # 4. 禁止降级：只能升级，不能降低强度
+        if target_strength < target.strength:
+            return self._violation(
+                f"禁止降级树枝: 当前={target.strength} 目标={target_strength}")
+
+        # 5. 点数检查
         diff = target_strength - target.strength
         if diff > 0 and game.points['BLUE'] < diff:
             return self._violation(f"点数不足: 需要 {diff}, 拥有 {game.points['BLUE']}")
