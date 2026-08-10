@@ -2,16 +2,70 @@ name: Create Release ZIP
 
 on:
   push:
-    tags:          # 推送v*标签时触发
-      - 'v*'
+    tags:
+      - 'v*'                
+  workflow_dispatch:        
 
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write       
+
     steps:
+      
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      
+      - name: Parse tag info
+        id: tag_info
+        run: |
+          set -euo pipefail   
+          
+          TAG="${{ github.ref_name }}"          
+          VERSION="${TAG
+          
+          if [[ "$VERSION" == *-p-r ]]; then
+            PRERELEASE="true"
+            VERSION="${VERSION%-p-r}"          
+          else
+            PRERELEASE="false"
+          fi
+          
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
+
+      
+      - name: Extract commit message
+        id: commit_msg
+        run: |
+          set -euo pipefail
+          
+          
+          MSG=$(git log -1 --pretty=format:%B)
+          
+          
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "$MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      
       - name: Create recursive source ZIP
         uses: espressif/release-zips-action@v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          
+          
+          release_name: "${{ steps.tag_info.outputs.version }}"
+          
+          
+          release_body: ${{ steps.commit_msg.outputs.body }}
+          
+          
+          release_prerelease: ${{ steps.tag_info.outputs.prerelease }}
+          
+          
