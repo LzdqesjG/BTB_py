@@ -100,12 +100,24 @@ class AIThinker:
     def decide_action(self):
         """返回 AI 的下一步动作。
 
-        优先级：拾取 > 穿敌方根 > 主动切割 > 警戒区拦截 > 根紧急防御 > 调枝 > 常规放置 > 结束
+        优先级：根危预检 > 穿敌方根 > 主动切割 > 警戒区拦截 > 根紧急防御 > 调枝 > 常规放置 > 绝望放置 > 结束
         """
-        # 硬规则 1：点数包在范围内 → 优先拾取
-        pickup_action = self._force_pickup()
-        if pickup_action:
-            return pickup_action
+        # 根危预检：敌方接近己方根时，跳过拾取和扩张，强制防御
+        root_danger = False
+        if self._own_root:
+            min_enemy_dist = float('inf')
+            for en in self.game.nodes:
+                if en.team == self._enemy:
+                    d = math.hypot(en.x - self._own_root.x, en.y - self._own_root.y)
+                    if d < min_enemy_dist:
+                        min_enemy_dist = d
+            root_danger = min_enemy_dist < self._cfg.get('root_danger_range', 450)
+
+        # 硬规则 1：点数包在范围内 → 优先拾取（根危时跳过）
+        if not root_danger:
+            pickup_action = self._force_pickup()
+            if pickup_action:
+                return pickup_action
 
         # 硬规则 2：己方节点接近敌方根 → 尝试穿过敌方根
         attack_root_action = self._force_attack_root()
@@ -117,12 +129,12 @@ class AIThinker:
         if cut_action:
             return cut_action
 
-        # 硬规则 3：敌方进入警戒区 → 强制布拦截
+        # 硬规则 4：敌方进入警戒区 → 强制布拦截
         zone_action = self._force_defend_zone()
         if zone_action:
             return zone_action
 
-        # 硬规则 4：敌方进入根节点紧急范围 → 强制切割
+        # 硬规则 5：敌方进入根节点紧急范围 → 强制切割
         threat_action = self._force_defend_root()
         if threat_action:
             return threat_action
@@ -138,10 +150,50 @@ class AIThinker:
         if candidates:
             return self._select_weighted(candidates)
 
-        # 7. 结束回合
+        # 7. 绝望模式：无处可走时，放宽间距限制，强制找位置落脚
+        desperate = self._desperate_place()
+        if desperate:
+            return desperate
+
+        # 8. 结束回合
         return {'type': 'end_turn'}
 
     # ==================== 硬规则 ====================
+
+    def _desperate_place(self):
+        """绝望模式：无处可走时，放宽间距限制找落脚点。
+        只检查 _in_bounds，降低 _too_close_to_any 到 NODE_RADIUS*2。
+        放置强度=1、范围=120（消耗 0）。"""
+        own_nodes = [n for n in self.game.nodes
+                     if n.team == self._team and n.can_have_child()]
+        if not own_nodes:
+            return None
+        # 降低间距阈值到 NODE_RADIUS * 2 = 50px
+        desperate_spacing = NODE_RADIUS * 2.0
+        for node in own_nodes:
+            for a_idx in range(16):
+                angle = (math.tau / 16) * a_idx
+                tx = node.x + 120 * math.cos(angle)
+                ty = node.y + 120 * math.sin(angle)
+                if not self._in_bounds(tx, ty):
+                    continue
+                # 宽松间距检查
+                ok = True
+                for n in self.game.nodes:
+                    if math.hypot(tx - n.x, ty - n.y) < desperate_spacing:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                return {
+                    'type': 'place_node',
+                    'parent': node,
+                    'x': tx,
+                    'y': ty,
+                    'strength': 1,
+                    'range_index': 0,
+                }
+        return None
 
     def _force_pickup(self):
         """点数包在范围内 → 强制放置节点拾取。"""
@@ -169,6 +221,7 @@ class AIThinker:
                         'x': pack.x,
                         'y': pack.y,
                         'strength': self._fp['strength'],
+                        'range_index': range_index,
                     }
         return None
 
@@ -198,8 +251,24 @@ class AIThinker:
 
                 if not self._in_bounds(target_x, target_y):
                     continue
-                if self._too_close_to_any(target_x, target_y):
-                    continue
+                if self._too_close_to_any(target_x, target_y, exclude=[en]):
+                    # 微调角度重试，避免因间距被直接跳过
+                    found = False
+                    for jitter_a in [0.3, -0.3, 0.6, -0.6, 0.9, -0.9]:
+                        ca, sa = math.cos(jitter_a), math.sin(jitter_a)
+                        rdx = dx * ca - dy * sa
+                        rdy = dx * sa + dy * ca
+                        rd = math.hypot(rdx, rdy)
+                        if rd < 1:
+                            continue
+                        tjx = en.x + (rdx / rd) * extend
+                        tjy = en.y + (rdy / rd) * extend
+                        if self._in_bounds(tjx, tjy) and not self._too_close_to_any(tjx, tjy, exclude=[en]):
+                            target_x, target_y = tjx, tjy
+                            found = True
+                            break
+                    if not found:
+                        continue
 
                 target_dist = math.hypot(target_x - node.x, target_y - node.y)
                 range_index = self._dist_to_range(target_dist)
@@ -219,6 +288,7 @@ class AIThinker:
                     'x': target_x,
                     'y': target_y,
                     'strength': strength,
+                    'range_index': range_index,
                 }
         return None
 
@@ -255,8 +325,18 @@ class AIThinker:
 
             if not self._in_bounds(ix, iy):
                 continue
-            if self._too_close_to_any(ix, iy):
-                continue
+            if self._too_close_to_any(ix, iy, exclude=[threatening_enemy]):
+                # 微调拦截点位置重试
+                found = False
+                for offset_ratio in [0.25, 0.45, 0.20, 0.50, 0.15, 0.55]:
+                    ix2 = threatening_enemy.x + (self._own_root.x - threatening_enemy.x) * offset_ratio
+                    iy2 = threatening_enemy.y + (self._own_root.y - threatening_enemy.y) * offset_ratio
+                    if self._in_bounds(ix2, iy2) and not self._too_close_to_any(ix2, iy2, exclude=[threatening_enemy]):
+                        ix, iy = ix2, iy2
+                        found = True
+                        break
+                if not found:
+                    continue
 
             target_dist = math.hypot(ix - node.x, iy - node.y)
             range_index = self._dist_to_range(target_dist)
@@ -277,6 +357,7 @@ class AIThinker:
                 'x': ix,
                 'y': iy,
                 'strength': strength,
+                'range_index': range_index,
             }
         return None
 
@@ -315,8 +396,23 @@ class AIThinker:
 
             if not self._in_bounds(target_x, target_y):
                 continue
-            if self._too_close_to_any(target_x, target_y):
-                continue
+            if self._too_close_to_any(target_x, target_y, exclude=[threatening_enemy]):
+                found = False
+                for jitter_a in [0.3, -0.3, 0.6, -0.6, 0.9, -0.9]:
+                    ca, sa = math.cos(jitter_a), math.sin(jitter_a)
+                    rdx = dx * ca - dy * sa
+                    rdy = dx * sa + dy * ca
+                    rd = math.hypot(rdx, rdy)
+                    if rd < 1:
+                        continue
+                    tjx = threatening_enemy.x + (rdx / rd) * extend
+                    tjy = threatening_enemy.y + (rdy / rd) * extend
+                    if self._in_bounds(tjx, tjy) and not self._too_close_to_any(tjx, tjy, exclude=[threatening_enemy]):
+                        target_x, target_y = tjx, tjy
+                        found = True
+                        break
+                if not found:
+                    continue
 
             target_dist = math.hypot(target_x - node.x, target_y - node.y)
             range_index = self._dist_to_range(target_dist)
@@ -335,6 +431,7 @@ class AIThinker:
                 'x': target_x,
                 'y': target_y,
                 'strength': strength,
+                'range_index': range_index,
             }
         return None
 
@@ -366,8 +463,23 @@ class AIThinker:
 
             if not self._in_bounds(target_x, target_y):
                 continue
-            if self._too_close_to_any(target_x, target_y):
-                continue
+            if self._too_close_to_any(target_x, target_y, exclude=[self._enemy_root]):
+                found = False
+                for jitter_a in [0.3, -0.3, 0.6, -0.6, 0.9, -0.9]:
+                    ca, sa = math.cos(jitter_a), math.sin(jitter_a)
+                    rdx = dx * ca - dy * sa
+                    rdy = dx * sa + dy * ca
+                    rd = math.hypot(rdx, rdy)
+                    if rd < 1:
+                        continue
+                    tjx = self._enemy_root.x + (rdx / rd) * extend
+                    tjy = self._enemy_root.y + (rdy / rd) * extend
+                    if self._in_bounds(tjx, tjy) and not self._too_close_to_any(tjx, tjy, exclude=[self._enemy_root]):
+                        target_x, target_y = tjx, tjy
+                        found = True
+                        break
+                if not found:
+                    continue
 
             target_dist = math.hypot(target_x - node.x, target_y - node.y)
             range_index = self._dist_to_range(target_dist)
@@ -386,6 +498,7 @@ class AIThinker:
                 'x': target_x,
                 'y': target_y,
                 'strength': strength,
+                'range_index': range_index,
             }
         return None
 
@@ -440,11 +553,76 @@ class AIThinker:
                             'x': x,
                             'y': y,
                             'strength': strength,
+                            'range_index': range_index,
                         }, score))
+
+        # ===== 定向切割候选：强制生成穿过敌方节点的候选 =====
+        cut_search_range = 320
+        cut_extend = NODE_RADIUS * 2.5
+        for node in own_nodes:
+            for en in enemy_nodes:
+                d = math.hypot(node.x - en.x, node.y - en.y)
+                if d < 1 or d > cut_search_range:
+                    continue
+                dx = en.x - node.x
+                dy = en.y - node.y
+                # 落点在敌方后方（延伸 NODE_RADIUS * 2.5）
+                tx = en.x + (dx / d) * cut_extend
+                ty = en.y + (dy / d) * cut_extend
+                if not self._in_bounds(tx, ty):
+                    # 如果后方出界，尝试落在敌方正上方 / 前方
+                    tx2 = en.x - (dx / d) * cut_extend
+                    ty2 = en.y - (dy / d) * cut_extend
+                    if self._in_bounds(tx2, ty2):
+                        tx, ty = tx2, ty2
+                    else:
+                        continue
+                if self._too_close_to_any(tx, ty, exclude=[en]):
+                    # 轻微抖动位置重试
+                    for offset_angle in [0.3, -0.3, 0.6, -0.6]:
+                        cos_a = math.cos(offset_angle)
+                        sin_a = math.sin(offset_angle)
+                        rotated_dx = dx * cos_a - dy * sin_a
+                        rotated_dy = dx * sin_a + dy * cos_a
+                        rd = math.hypot(rotated_dx, rotated_dy)
+                        if rd < 1:
+                            continue
+                        tx_jitter = en.x + (rotated_dx / rd) * cut_extend
+                        ty_jitter = en.y + (rotated_dy / rd) * cut_extend
+                        if self._in_bounds(tx_jitter, ty_jitter) and not self._too_close_to_any(tx_jitter, ty_jitter, exclude=[en]):
+                            tx, ty = tx_jitter, ty_jitter
+                            break
+                    else:
+                        continue
+                target_dist = math.hypot(tx - node.x, ty - node.y)
+                range_index = self._dist_to_range(target_dist)
+                if range_index == 0 and self._points >= self._ru['unconditional_points']:
+                    range_index = 1
+                need_str = min(MAX_STRENGTH, en.strength + 1)
+                max_afford = max(1, min(MAX_STRENGTH, 1 + self._points - range_index))
+                strength = max(need_str, min(MAX_STRENGTH, max_afford))
+                if strength > max_afford:
+                    strength = max_afford
+                cost = range_index + max(0, strength - 1)
+                if cost > self._points:
+                    continue
+                score = self._score(node, tx, ty, strength, range_index, enemy_nodes)
+                if score > 0:
+                    candidates.append(({
+                        'type': 'place_node',
+                        'parent': node,
+                        'x': tx,
+                        'y': ty,
+                        'strength': strength,
+                        'range_index': range_index,
+                    }, score))
 
         return candidates
 
     def _select_weighted(self, candidates):
+        # 存储候选供主游戏可视化
+        self.game._ai_debug_candidates = [(a, s) for a, s in candidates]
+
         if len(candidates) == 1:
             return candidates[0][0]
 
@@ -648,9 +826,12 @@ class AIThinker:
         return (PLAY_MARGIN <= x <= SCREEN_WIDTH - PLAY_MARGIN and
                 PLAY_AREA_TOP <= y <= SCREEN_HEIGHT - PLAY_MARGIN)
 
-    def _too_close_to_any(self, x, y):
+    def _too_close_to_any(self, x, y, exclude=None):
+        """检查 (x,y) 是否离任何已有节点太近。exclude 为要排除的节点列表。"""
         min_dist = NODE_RADIUS * self._pl['min_node_spacing']
         for n in self.game.nodes:
+            if exclude and n in exclude:
+                continue
             if math.hypot(x - n.x, y - n.y) < min_dist:
                 return True
         return False

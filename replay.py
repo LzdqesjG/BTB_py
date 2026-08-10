@@ -46,10 +46,11 @@ class ReplayRecorder:
     def save(self):
         """保存回放到文件（仅在未保存过时执行）。"""
         if self._saved:
-            return
+            return None
         self._saved = True
         path = self.filepath
         with open(path, 'w', encoding='utf-8') as f:
             for action in self.actions:
                 f.write(json.dumps(action, ensure_ascii=False) + '\n')
         print(f"[Replay] 已保存: {path}  ({len(self.actions)} 步)")
+        return path

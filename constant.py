@@ -2,7 +2,7 @@
 import os
 import sys
 
-VERSION = "v1.3"
+VERSION = "v1.4"
 AUTHOR = "Lzdqesj"
 
 SCREEN_WIDTH, SCREEN_HEIGHT = 1300, 700
@@ -75,6 +75,13 @@ SHEAR_SOUNDS = [
     'shear_x0.90.ogg', 'shear_x0.95.ogg', 'shear_x1.00.ogg',
     'shear_x1.05.ogg', 'shear_x1.10.ogg', 'shear_x1.15.ogg',
 ]
+
+# 轮回：6 个变调全随机
+IDLE_SOUNDS = [
+    'idle1_x0.90.ogg', 'idle1_x0.95.ogg', 'idle1_x1.00.ogg',
+    'idle1_x1.05.ogg', 'idle1_x1.10.ogg', 'idle1_x1.15.ogg',
+]
+
 
 # 点数包：按分值分段，每段 2 个随机
 ORB_SOUNDS = {

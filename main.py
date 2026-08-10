@@ -3,6 +3,7 @@ import pygame.gfxdraw
 import math
 import sys
 import os
+import shutil
 import random
 
 from constant import *
@@ -13,7 +14,9 @@ from replay import ReplayRecorder
 pygame.init()
 
 _sfx_bank = {}         # {filename: Sound}
-_sfx_debug_log = []    # 调试模式：[(filename, tick), ...]
+# 通用调试日志池: [(text, color, tick, duration_ms), ...]
+_debug_entries = []
+DEFAULT_DEBUG_DURATION = 2000  # 默认显示时长(ms)
 DEBUG_MODE = os.path.isfile(os.path.join(os.path.dirname(__file__), 'debug'))
 DEBUGS = []
 with open('debug', 'r', encoding='utf-8') as f:
@@ -46,12 +49,52 @@ def _load_one(filename):
         print(f"[SFX] 加载失败: {path} - {e}")
 
 
-def _play_file(fname):
+def _play_file(fname: str):
     snd = _sfx_bank.get(fname)
     if snd:
         snd.play()
         if DEBUG_MODE:
-            _sfx_debug_log.append((fname, pygame.time.get_ticks()))
+            fname_short = fname.rsplit('.', 1)[0]  # 去扩展名
+            add_debug_log(f"[DEBUG] Sound - {fname_short}", (-1, -1, -1))
+
+
+def add_debug_log(text, color=(-1, -1, -1), duration_ms=None):
+    """向左下角调试日志池添加一条消息。
+    - text: 显示文本
+    - color: RGB 元组
+    - duration_ms: 显示时长(ms)，默认 2000
+    """
+    if color == (-1, -1, -1):
+        color = randcolor("noblack")
+    if not DEBUG_MODE:
+        return
+    tick = pygame.time.get_ticks()
+    dur = duration_ms if duration_ms is not None else DEFAULT_DEBUG_DURATION
+    _debug_entries.append((text, color, tick, dur))
+
+
+def draw_debug_logs(surface, font=None, padding_x=10, padding_bottom=20, gap=16,
+                    filter_tags=None):
+    """在 surface 左下角自底向上绘制调试日志。
+    - font: 默认为 font_tiny
+    - filter_tags: 可选包含标签的字符串列表，只绘制包含该标签的条目
+    """
+    if font is None:
+        font = font_tiny  # noqa: F821 — 模块级字体，draw() 中调用时已在作用域
+    now = pygame.time.get_ticks()
+    # 清理过期条目
+    _debug_entries[:] = [
+        (t, c, tick, d) for t, c, tick, d in _debug_entries
+        if now - tick < d
+    ]
+    # 自底向上绘制
+    entries = _debug_entries
+    if filter_tags:
+        entries = [(t, c, tick, d) for t, c, tick, d in entries
+                   if any(tag in t for tag in filter_tags)]
+    for i, (text, color, _tick, _dur) in enumerate(reversed(entries)):
+        txt = font.render(text, True, color)
+        surface.blit(txt, (padding_x, SCREEN_HEIGHT - padding_bottom - i * gap))
 
 
 def play_sfx(name, **kwargs):
@@ -74,6 +117,8 @@ def play_sfx(name, **kwargs):
         fname = random.choice(ORB_SOUNDS.get(value, ORB_SOUNDS[1]))
     elif name == 'click':
         fname = CLICK_SOUND
+    elif name == 'turn':
+        fname = random.choice(IDLE_SOUNDS)
     else:
         fname = f'{name}.ogg'
     _play_file(fname)
@@ -88,6 +133,15 @@ font_big = get_font(36, bold=True)
 font_mid = get_font(22)
 font_small = get_font(16)
 font_tiny = get_font(13)
+
+def randcolor(mode:str='all'):
+    if mode == 'all':
+        return (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
+    elif mode == 'noblack':
+        return (random.randint(32, 255), random.randint(32, 255), random.randint(32, 255))
+    else:
+        raise ValueError(f"未知颜色模式: {mode}")
+
 
 def _draw_aa_circle(surface, color, center, radius):
     """绘制抗锯齿实心圆（填充 + AA 描边）。
@@ -134,6 +188,10 @@ def _draw_aa_circle_outline(surface, color, center, radius, width=1):
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption(f"Binary Tree Battle - {VERSION}")
 clock = pygame.time.Clock()
+add_debug_log("[DEBUG] 调试模式已激活, 调试选项:", (-1, -1, -1), 3000)
+for i in DEBUGS:
+    add_debug_log(f" - {i}", (-1, -1, -1), 3000)
+play_sfx('victory')
 
 
 class Node:
@@ -302,6 +360,8 @@ class Game:
         self._ai_mode = False
         self._ai_team = None          # AI 控制的队伍
         self._ai_think_timer = 0
+        self._AI_THINK_DELAY = 90  # ~1.5 秒思考时间
+        self._ai_debug_candidates = []  # AI 候选可视化数据
         self._resume_from_replay = False
 
         # 回放记录器
@@ -595,7 +655,10 @@ class Game:
             return
 
         if self.state == STATE_GAME_OVER:
-            self.replay.save()
+            fname = self.replay.save()
+            if fname:
+                add_debug_log(f"[DEBUG] Replay saved: {fname}", (-1, -1, -1), 3000)
+            
             return
 
         if self.state == STATE_REPLAY_PLAY:
@@ -715,6 +778,28 @@ class Game:
         closest_y = y1 + t * dy
         dist_sq = (closest_x - cx) ** 2 + (closest_y - cy) ** 2
         return dist_sq <= radius * radius
+
+    @staticmethod
+    def _draw_dashed_line(surface, p1, p2, color, dash_len=8, gap_len=6, width=1):
+        """绘制虚线。color 支持 RGBA 元组（含透明度）。"""
+        x1, y1 = p1
+        x2, y2 = p2
+        dx, dy = x2 - x1, y2 - y1
+        total = math.hypot(dx, dy)
+        if total < 1:
+            return
+        ux, uy = dx / total, dy / total
+        seg = dash_len + gap_len
+        drawn = 0.0
+        while drawn < total:
+            start_x = x1 + ux * drawn
+            start_y = y1 + uy * drawn
+            end = min(dash_len, total - drawn)
+            end_x = x1 + ux * (drawn + end)
+            end_y = y1 + uy * (drawn + end)
+            pygame.draw.line(surface, color, (int(start_x), int(start_y)),
+                             (int(end_x), int(end_y)), width)
+            drawn += seg
 
     def _collect_subtree(self, root_node):
         """收集以 root_node 为根的所有后代节点（含 root_node 自己）。"""
@@ -1127,6 +1212,32 @@ class Game:
         for popup in self.score_popups:
             popup.draw(surface)
 
+        # ===== AI 候选可视化 =====
+        if self._ai_debug_candidates:
+            max_score = max(s for _, s in self._ai_debug_candidates)
+            max_score = max(max_score, 1.0)  # 避免除零
+            for action, score in self._ai_debug_candidates:
+                parent = action['parent']
+                x, y = action['x'], action['y']
+                strength = action['strength']
+                alpha = int(80 + 100 * (score / max_score))  # 80~180 透明度
+                # 连线：半透明虚线
+                self._draw_dashed_line(surface, (parent.x, parent.y), (x, y),
+                                       (255, 255, 120, alpha), dash_len=8, gap_len=6, width=1)
+                # 候选节点小圆
+                r = NODE_RADIUS * 0.5 + strength * 0.5
+                color = TEAM_COLORS[self.current_team]['main']
+                # 外圈
+                pygame.draw.circle(surface, (*color[:3], alpha),
+                                   (int(x), int(y)), int(r), 1)
+                # 填充
+                pygame.draw.circle(surface, (*color[:3], alpha // 3),
+                                   (int(x), int(y)), int(r - 1))
+                # 评分数字
+                s_txt = font_tiny.render(str(int(score)), True,
+                                         (255, 255, 180, alpha))
+                surface.blit(s_txt, s_txt.get_rect(center=(x, y - r - 8)))
+
         # ===== HUD 顶部信息 =====
         # 红方信息
         hud_red = pygame.Rect(10, 8, 180, 62)
@@ -1207,7 +1318,9 @@ class Game:
 
         # 底部提示
         if self._ai_mode and self.current_team == self._ai_team:
-            hint = font_tiny.render("AI 思考中...", True, (200, 160, 60))
+            pct = int(self._ai_think_timer / self._AI_THINK_DELAY * 100)
+            progress_label = f"AI 思考中... ({pct}%)" if self._ai_think_timer > 0 else "AI 思考中..."
+            hint = font_tiny.render(progress_label, True, (200, 160, 60))
         elif self.network_mode and self.current_team != self.my_team:
             hint = font_tiny.render("等待对方操作...", True, (200, 200, 100))
         elif self.dragging:
@@ -1317,6 +1430,7 @@ class Game:
         else:
             self._replay_files = []
         self._replay_selected = 0
+        self._replay_delete_mode = False
         self.state = STATE_REPLAY_SELECT
 
     def _parse_replay_meta(self, fname):
@@ -1664,8 +1778,7 @@ class Game:
 
     def _ai_update(self):
         """AI 回合自动操作。每帧调用，延迟后执行 AI 动作。"""
-        AI_THINK_DELAY = 90  # ~1.5 秒思考时间
-        if self._ai_think_timer < AI_THINK_DELAY:
+        if self._ai_think_timer < self._AI_THINK_DELAY:
             self._ai_think_timer += 1
             return
 
@@ -1689,25 +1802,33 @@ class Game:
             parent = action['parent']
             x, y = action['x'], action['y']
             strength = action['strength']
+            range_index = action.get('range_index', 0)
             # 检查合法性
             if not parent.can_have_child():
                 self._end_turn()
                 return
-            strength_cost = max(0, strength - 1)
-            if self.points[self.current_team] < strength_cost:
-                self._end_turn()
-                return
+            total_cost = range_index + max(0, strength - 1)
+            if self.points[self.current_team] < total_cost:
+                # 点数不足：尝试回退到最低消耗（强度1，范围120，消耗0）
+                if self.points[self.current_team] >= 0:
+                    strength = 1
+                    range_index = 0
+                    total_cost = 0
+                else:
+                    self._end_turn()
+                    return
             # 创建节点
             new_node = Node(self.current_team, x, y, strength, parent=parent)
             parent.children.append(new_node)
             self.nodes.append(new_node)
-            self.points[self.current_team] -= strength_cost
+            self.points[self.current_team] -= total_cost
             play_sfx('tap', strength=strength)
 
-            # 回放：记录 AI 放置节点
+            # 回放：记录 AI 放置节点（含实际 range 半径）
+            actual_range = RANGE_OPTIONS[range_index] if range_index < len(RANGE_OPTIONS) else RANGE_OPTIONS[-1]
             self.replay.record('place_node', team=self.current_team,
                                parent_id=parent.id, node_id=new_node.id,
-                               x=x, y=y, strength=strength, range=0)
+                               x=x, y=y, strength=strength, range=actual_range)
 
             removed_ids, winner, weakened = self._resolve_crossing(new_node)
             if removed_ids:
@@ -1783,6 +1904,7 @@ class Game:
         self.dragging = False
         self.drag_node = None
         self.hovered_branch_child = None
+        self._ai_debug_candidates = []  # 清除 AI 候选可视化
 
         # 回放：记录结束回合
         previous_team = self.current_team
@@ -1817,15 +1939,9 @@ class Game:
         else:
             self.draw_playing(surface)
 
-        # 调试模式：左下角显示最近播放的音效文件名
-        if DEBUG_MODE and _sfx_debug_log and 'SHOW_DEBUG_INFO' in DEBUGS:
-            now = pygame.time.get_ticks()
-            _sfx_debug_log[:] = [(f, t) for f, t in _sfx_debug_log if now - t < 2000]
-            for i, (fname, _t) in enumerate(reversed(_sfx_debug_log)):
-                fnamee = fname.replace(fname.split('.')[-1], "")[:-1]
-                finaltext = f"[DEBUG] Sound #{i} - {fnamee}"
-                txt = font_tiny.render(finaltext, True, (102, 204, 255))
-                surface.blit(txt, (10, SCREEN_HEIGHT - 20 - i * 16))
+        # 调试模式：左下角显示调试日志
+        if DEBUG_MODE:
+            draw_debug_logs(surface)
 
     def draw_host_wait(self, surface):
         """房主等待客户端加入界面。"""
@@ -1971,8 +2087,13 @@ class Game:
 
                 # 选中高亮
                 if is_selected:
-                    bar = pygame.Rect(SCREEN_WIDTH // 2 - 300, y - 2, 600, 28)
-                    pygame.draw.rect(surface, (50, 80, 150), bar, border_radius=4)
+                    if self._replay_delete_mode:
+                        bar = pygame.Rect(SCREEN_WIDTH // 2 - 300, y - 2, 600, 28)
+                        pygame.draw.rect(surface, (150, 30, 30), bar, border_radius=4)
+                        pygame.draw.rect(surface, (255, 60, 60), bar, 2, border_radius=4)
+                    else:
+                        bar = pygame.Rect(SCREEN_WIDTH // 2 - 300, y - 2, 600, 28)
+                        pygame.draw.rect(surface, (50, 80, 150), bar, border_radius=4)
 
                 _offset = -4
 
@@ -1993,7 +2114,10 @@ class Game:
                 surface.blit(meta_txt, (SCREEN_WIDTH // 2 + 290 - meta_rect.width, y + _offset))
 
         # 底部提示
-        hint = font_tiny.render("↑↓ 选择   Enter 确认   Esc 返回", True, DARK_GRAY)
+        if self._replay_delete_mode:
+            hint = font_tiny.render("↑↓ 选择   Tab 删除   Del / Esc 退出删除模式", True, (255, 80, 80))
+        else:
+            hint = font_tiny.render("↑↓ 选择   Enter 确认   Del 删除   Esc 返回", True, DARK_GRAY)
         surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 20)))
 
     def _handle_replay_select_event(self, event):
@@ -2002,8 +2126,41 @@ class Game:
             pygame.quit()
             sys.exit()
         if event.type == pygame.KEYDOWN:
+            # 删除模式：Del 退出，Tab 确认删除
+            if self._replay_delete_mode:
+                if event.key == pygame.K_DELETE:
+                    self._replay_delete_mode = False
+                    return
+                if event.key == pygame.K_TAB:
+                    if self._replay_files:
+                        fname = self._replay_files[self._replay_selected][0]
+                        src = os.path.join(os.path.dirname(__file__), 'replays', fname)
+                        del_dir = os.path.join(os.path.dirname(__file__), 'replays', 'deleted')
+                        os.makedirs(del_dir, exist_ok=True)
+                        dst = os.path.join(del_dir, fname)
+                        shutil.move(src, dst)
+                        del self._replay_files[self._replay_selected]
+                        play_sfx('shear')
+                        if self._replay_files:
+                            self._replay_selected = min(self._replay_selected, len(self._replay_files) - 1)
+                        return
+                if event.key == pygame.K_ESCAPE:
+                    self._replay_delete_mode = False
+                    return
+                if event.key in (pygame.K_UP, pygame.K_DOWN):
+                    if self._replay_files:
+                        n = len(self._replay_files)
+                        delta = -1 if event.key == pygame.K_UP else 1
+                        self._replay_selected = (self._replay_selected + delta) % n
+                        play_sfx('click')
+                    return
+                return  # 删除模式下忽略其他按键
+
             if event.key == pygame.K_ESCAPE:
                 self.state = STATE_MENU
+            elif event.key == pygame.K_DELETE:
+                if self._replay_files:
+                    self._replay_delete_mode = True
             elif event.key in (pygame.K_UP, pygame.K_DOWN):
                 if self._replay_files:
                     n = len(self._replay_files)
@@ -2165,21 +2322,43 @@ class Game:
         for pack in self.pickups:
             pack.draw(surface)
 
-        # 顶部信息栏
-        hud = pygame.Rect((SCREEN_WIDTH - 360) // 2, 8, 360, 36)
+        # ===== 顶部 HUD：红方/步骤/蓝方 =====
+        # 红方信息面板（左侧）
+        hud_red = pygame.Rect(10, 8, 180, 62)
+        pygame.draw.rect(surface, PANEL_COLOR, hud_red, border_radius=6)
+        pygame.draw.rect(surface, RED, hud_red, 2, border_radius=6)
+        red_label = self._team_label('RED')
+        rt = font_mid.render(f"{red_label} (红方)", True, LIGHT_RED)
+        surface.blit(rt, (hud_red.x + 10, hud_red.y + 6))
+        rp = font_small.render(f"点数: {self.points['RED']}", True, WHITE)
+        surface.blit(rp, (hud_red.x + 10, hud_red.y + 32))
+        rc = font_small.render(f"节点: {len(self.get_nodes_of_team('RED'))}", True, GRAY)
+        surface.blit(rc, (hud_red.x + 100, hud_red.y + 32))
+
+        # 蓝方信息面板（右侧）
+        hud_blue = pygame.Rect(SCREEN_WIDTH - 190, 8, 180, 62)
+        pygame.draw.rect(surface, PANEL_COLOR, hud_blue, border_radius=6)
+        pygame.draw.rect(surface, BLUE, hud_blue, 2, border_radius=6)
+        blue_label = self._team_label('BLUE')
+        bt = font_mid.render(f"{blue_label} (蓝方)", True, LIGHT_BLUE)
+        surface.blit(bt, (hud_blue.x + 10, hud_blue.y + 6))
+        bp = font_small.render(f"点数: {self.points['BLUE']}", True, WHITE)
+        surface.blit(bp, (hud_blue.x + 10, hud_blue.y + 32))
+        bc = font_small.render(f"节点: {len(self.get_nodes_of_team('BLUE'))}", True, GRAY)
+        surface.blit(bc, (hud_blue.x + 100, hud_blue.y + 32))
+
+        # 中间步骤信息
+        hud = pygame.Rect((SCREEN_WIDTH - 300) // 2, 8, 300, 62)
         pygame.draw.rect(surface, PANEL_COLOR, hud, border_radius=6)
         total_steps = len(self._replay_steps)
-        step_label = f"回放模式  步骤 {self._replay_step_index + 1}/{total_steps}"
+        step_label = f"回放模式"
         txt = font_mid.render(step_label, True, WHITE)
-        surface.blit(txt, txt.get_rect(center=hud.center))
+        surface.blit(txt, txt.get_rect(center=(hud.centerx, hud.y + 16)))
+        step_label2 = f"步骤 {self._replay_step_index + 1}/{total_steps}"
+        txt2 = font_small.render(step_label2, True, GRAY)
+        surface.blit(txt2, txt2.get_rect(center=(hud.centerx, hud.y + 42)))
 
-        # 胜利提示
-        if self.winner:
-            wcolor = TEAM_COLORS[self.winner]['main']
-            wtxt = font_mid.render(f"{TEAM_COLORS[self.winner]['name']} 获胜", True, wcolor)
-            surface.blit(wtxt, wtxt.get_rect(center=(SCREEN_WIDTH // 2, 55)))
-
-        # 控制按钮（顶部信息栏下方）
+        # 控制按钮（顶部 HUD 下方）
         mouse_pos = pygame.mouse.get_pos()
         btn_w, btn_h = 90, 30
         btn_y = hud.bottom + 8
@@ -2215,6 +2394,13 @@ class Game:
         self._replay_enter_rect = _draw_btn(bx4, "进入游戏",
                                             can_enter,
                                             (160, 120, 20))
+
+        # 胜利提示（按钮下方，避免遮挡）
+        if self.winner:
+            wcolor = TEAM_COLORS[self.winner]['main']
+            winner_name = self._team_label(self.winner)
+            wtxt = font_mid.render(f"{winner_name} 获胜", True, wcolor)
+            surface.blit(wtxt, wtxt.get_rect(center=(SCREEN_WIDTH // 2, btn_y + btn_h + 18)))
 
         # 返回按钮
         back_rect = pygame.Rect(SCREEN_WIDTH - 120, SCREEN_HEIGHT - 50, 100, 34)
