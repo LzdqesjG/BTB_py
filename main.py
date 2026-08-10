@@ -333,8 +333,13 @@ class Game:
         # 一回合只能创建一个节点
         self.has_created_this_turn = False
 
-        # 悬停的树枝（child node），用于滚轮调强度
+        # 悬停的树枝（child node），用于右键进入修改模式
         self.hovered_branch_child = None
+
+        # 树枝修改模式（右键进入）
+        self._branch_modify_mode = False
+        self._branch_modify_target = None    # 被修改的 Node
+        self._branch_modify_strength = 1     # UI 中显示的暂定新强度
 
         # 点数包
         self.pickups = []
@@ -1327,12 +1332,82 @@ class Game:
         elif self.dragging:
             hint = font_tiny.render("滚轮调强度 | 空格切范围 | 松开鼠标创建节点", True, DARK_GRAY)
         elif self.hovered_branch_child is not None:
-            hint = font_tiny.render("滚轮上/下 调节树枝强度（+1消耗1点 / -1返还1点）", True, (160, 220, 160))
+            hint = font_tiny.render("右键进入树枝修改模式（仅可升级，不能降级）", True, (160, 220, 160))
         elif self.has_created_this_turn:
-            hint = font_tiny.render("本回合已创建节点，可调树枝强度 | Tab/按钮 结束回合", True, (200, 200, 100))
+            hint = font_tiny.render("本回合已创建节点 | 右键树枝修改强度 | Tab/按钮 结束回合", True, (200, 200, 100))
         else:
-            hint = font_tiny.render("提示: 拖动己方节点创建分支 | 悬停树枝滚轮调强度 | 空格切范围 | Tab结束回合", True, DARK_GRAY)
+            hint = font_tiny.render("提示: 拖动己方节点创建分支 | 右键树枝进入修改 | 空格切范围 | Tab结束回合", True, DARK_GRAY)
         surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 15)))
+
+        # 树枝修改模式覆盖层
+        if self._branch_modify_mode and self._branch_modify_target:
+            self._draw_branch_modify_overlay(surface)
+
+    def _draw_branch_modify_overlay(self, surface):
+        """绘制树枝修改模式 UI 覆盖层。"""
+        target = self._branch_modify_target
+
+        # 半透明全屏暗色遮罩
+        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 120))
+        surface.blit(overlay, (0, 0))
+
+        # 高亮目标树枝
+        if target.parent:
+            glow_w = max(1, target.strength) + 8
+            light = TEAM_COLORS[target.team]['light']
+            glow_surf = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+            pygame.draw.line(glow_surf, (*light, 100),
+                             (int(target.parent.x), int(target.parent.y)),
+                             (int(target.x), int(target.y)), glow_w)
+            pygame.draw.line(glow_surf, (*light, 180),
+                             (int(target.parent.x), int(target.parent.y)),
+                             (int(target.x), int(target.y)), glow_w - 4)
+            surface.blit(glow_surf, (0, 0))
+        # 高亮目标节点
+        ring_r = NODE_RADIUS + 8
+        _draw_aa_circle_outline(surface, (*TEAM_COLORS[target.team]['light'], 200),
+                                (int(target.x), int(target.y)), ring_r, 3)
+
+        # 信息面板（在目标节点旁边）
+        panel_w, panel_h = 280, 140
+        px = int(target.x) + NODE_RADIUS + 20
+        py = int(target.y) - panel_h // 2
+        if px + panel_w > SCREEN_WIDTH - 10:
+            px = int(target.x) - panel_w - NODE_RADIUS - 20
+        if py < 10:
+            py = 10
+        if py + panel_h > SCREEN_HEIGHT - 10:
+            py = SCREEN_HEIGHT - panel_h - 10
+
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        panel.fill((30, 30, 50, 230))
+        surface.blit(panel, (px, py))
+        pygame.draw.rect(surface, TEAM_COLORS[target.team]['light'], (px, py, panel_w, panel_h), 2, border_radius=8)
+
+        # 标题
+        t = font_mid.render("树枝修改模式", True, TEAM_COLORS[self.current_team]['light'])
+        surface.blit(t, (px + 10, py + 8))
+
+        # 分隔线
+        pygame.draw.line(surface, (100, 100, 140), (px + 8, py + 35), (px + panel_w - 16, py + 35), 1)
+
+        # 当前 → 新强度
+        cur = font_small.render(f"当前强度: {target.strength}", True, (180, 180, 180))
+        surface.blit(cur, (px + 12, py + 42))
+        new_color = (100, 255, 100) if self._branch_modify_strength > target.strength else (255, 100, 100)
+        new = font_small.render(f"新强度:   {self._branch_modify_strength}", True, new_color)
+        surface.blit(new, (px + 12, py + 64))
+
+        # 消耗
+        diff = self._branch_modify_strength - target.strength
+        cost_color = (100, 255, 100) if self.points[self.current_team] >= diff else (255, 100, 100)
+        cost = font_small.render(f"消耗点数: {diff}  (剩余 {self.points[self.current_team]})", True, cost_color)
+        surface.blit(cost, (px + 12, py + 86))
+
+        # 操作提示
+        tip = font_tiny.render("滚轮/↑↓ 调节  |  Enter/右键 确认  |  Esc 取消", True, (160, 160, 160))
+        surface.blit(tip, (px + 10, py + panel_h - 24))
 
     # ===== 事件处理 =====
     def handle_event(self, event):
@@ -1583,6 +1658,11 @@ class Game:
                 self.go_menu()
                 return
 
+        # 树枝修改模式：拦截所有输入
+        if self._branch_modify_mode:
+            self._handle_branch_modify_event(event)
+            return
+
         # 网络模式/AI模式：非己方回合时只允许鼠标移动
         if self._ai_mode:
             is_my_turn = (self.current_team != self._ai_team)
@@ -1597,6 +1677,13 @@ class Game:
 
         if event.type == pygame.MOUSEBUTTONDOWN:
             mx, my = event.pos
+            # 右键点击己方树枝 → 进入修改模式
+            if event.button == 3:
+                if self.hovered_branch_child is not None:
+                    node = self.hovered_branch_child
+                    if node.strength < MAX_STRENGTH and self.points[self.current_team] >= 1:
+                        self._enter_branch_modify(node)
+                    return
             # 左键按下：开始拖动
             if event.button == 1:
                 # 先检查是否点结束回合
@@ -1618,14 +1705,17 @@ class Game:
                             self.temp_range_index = 0  # 默认范围 120
                         return
 
-        # 滚轮事件 (pygame 2 / SDL2): pygame.MOUSEWHEEL
+        # 滚轮事件：仅拖动时生效（调节新节点强度）
         if event.type == pygame.MOUSEWHEEL:
-            self._handle_wheel(1 if event.y > 0 else -1)
-        # 方向键调节强度（无滚轮设备备选）
+            if self.dragging:
+                self._handle_wheel(1 if event.y > 0 else -1)
+        # 方向键：仅拖动时生效
         if event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
-            self._handle_wheel(1)
+            if self.dragging:
+                self._handle_wheel(1)
         elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
-            self._handle_wheel(-1)
+            if self.dragging:
+                self._handle_wheel(-1)
 
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             if self.dragging and self.drag_node is not None:
@@ -1646,7 +1736,8 @@ class Game:
             self._end_turn()
 
     def _handle_wheel(self, direction):
-        """滚轮事件处理。direction > 0 = 向上滚（强度+1），< 0 = 向下滚（强度-1）。"""
+        """滚轮事件处理。direction > 0 = 向上滚（强度+1），< 0 = 向下滚（强度-1）。
+        仅在拖动创建新节点时生效。"""
         if self.dragging:
             # 拖动中：调节新节点强度
             if direction > 0 and self.temp_strength < MAX_STRENGTH:
@@ -1655,42 +1746,86 @@ class Game:
             elif direction < 0 and self.temp_strength > MIN_STRENGTH:
                 self.temp_strength -= 1
                 play_sfx('tap', strength=self.temp_strength)
-        elif self.hovered_branch_child is not None:
-            child = self.hovered_branch_child
-            if direction > 0:
-                # 滚轮上 → 强度+1，消耗1点
-                if child.strength < MAX_STRENGTH and self.points[self.current_team] >= 1:
-                    old_str = child.strength
-                    if self.network_mode == 'client' and self.net_client:
-                        self.net_client.send_modify_branch(child.x, child.y, child.strength + 1)
-                    else:
-                        child.strength += 1
-                        self.points[self.current_team] -= 1
-                        self.replay.record('modify_branch', team=self.current_team,
-                                           node_id=child.id, old_strength=old_str,
-                                           new_strength=child.strength)
-                        if self.network_mode == 'host':
-                            import network_protocol as proto
-                            self._broadcast(proto.ACT_UPDATE_STRENGTH, child.id, child.strength)
-                            self._broadcast_state_changed()
-                    play_sfx('tap', strength=child.strength)
-            elif direction < 0:
-                # 滚轮下 → 强度-1（最低1），返还1点
-                if child.strength > MIN_STRENGTH:
-                    old_str = child.strength
-                    if self.network_mode == 'client' and self.net_client:
-                        self.net_client.send_modify_branch(child.x, child.y, child.strength - 1)
-                    else:
-                        child.strength -= 1
-                        self.points[self.current_team] += 1
-                        self.replay.record('modify_branch', team=self.current_team,
-                                           node_id=child.id, old_strength=old_str,
-                                           new_strength=child.strength)
-                        if self.network_mode == 'host':
-                            import network_protocol as proto
-                            self._broadcast(proto.ACT_UPDATE_STRENGTH, child.id, child.strength)
-                            self._broadcast_state_changed()
-                    play_sfx('tap', strength=child.strength)
+
+    # ===== 树枝修改模式 =====
+
+    def _enter_branch_modify(self, node):
+        """进入树枝修改模式。"""
+        self._branch_modify_mode = True
+        self._branch_modify_target = node
+        self._branch_modify_strength = node.strength + 1  # 必须 > 原强度
+        self.dragging = False
+        self.drag_node = None
+
+    def _handle_branch_modify_event(self, event):
+        """树枝修改模式专用事件处理。"""
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self._branch_modify_mode = False
+                self._branch_modify_target = None
+            elif event.key == pygame.K_RETURN:
+                self._confirm_branch_modify()
+        elif event.type == pygame.MOUSEWHEEL:
+            direction = 1 if event.y > 0 else -1
+            self._adjust_branch_modify_strength(direction)
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_UP:
+            self._adjust_branch_modify_strength(1)
+        elif event.type == pygame.KEYDOWN and event.key == pygame.K_DOWN:
+            self._adjust_branch_modify_strength(-1)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+            # 再次右键确认
+            self._confirm_branch_modify()
+
+    def _adjust_branch_modify_strength(self, direction):
+        """在修改模式中调节暂定强度。仅允许 > 原强度。"""
+        target = self._branch_modify_target
+        if target is None:
+            return
+        new_val = self._branch_modify_strength + direction
+        min_val = target.strength + 1
+        if min_val <= new_val <= MAX_STRENGTH:
+            self._branch_modify_strength = new_val
+
+    def _confirm_branch_modify(self):
+        """确认树枝修改：消耗点数，应用新强度。"""
+        target = self._branch_modify_target
+        if target is None:
+            return
+        diff = self._branch_modify_strength - target.strength
+        if diff <= 0:
+            self._branch_modify_mode = False
+            self._branch_modify_target = None
+            return
+        if self.points[self.current_team] < diff:
+            return  # 点数不足，无法确认
+
+        # 客户端模式：发送请求给服务器
+        if self.network_mode == 'client' and self.net_client:
+            self.net_client.send_modify_branch(target.x, target.y,
+                                               self._branch_modify_strength)
+            self._branch_modify_mode = False
+            self._branch_modify_target = None
+            return
+
+        old_str = target.strength
+        target.strength = self._branch_modify_strength
+        self.points[self.current_team] -= diff
+
+        # 回放记录
+        self.replay.record('modify_branch', team=self.current_team,
+                           node_id=target.id, old_strength=old_str,
+                           new_strength=target.strength)
+        # 联机广播
+        if self.network_mode == 'host':
+            import network_protocol as proto
+            self._broadcast(proto.ACT_UPDATE_STRENGTH, target.id, target.strength)
+            self._broadcast_state_changed()
+
+        play_sfx('tap', strength=target.strength)
+        self._branch_modify_mode = False
+        self._branch_modify_target = None
+
+    # ===== 树枝修改模式 END =====
 
     def _try_create_node(self, mx, my):
         node = self.drag_node
