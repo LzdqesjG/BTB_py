@@ -1,0 +1,77 @@
+name: Export Issues to File
+
+# 当 Issue 有变化时，把当前所有 Open 状态的 Issue 导出到仓库根目录的 ISSUES.md，
+# 并自动提交推送。这样本地 pull 后即可直接查看 Issue 内容。
+on:
+  issues:
+    types: [opened, edited, reopened, closed, deleted]
+  workflow_dispatch: # 也可手动触发一次
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Export open issues to ISSUES.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          OUT="ISSUES.md"
+
+          # 头部说明
+          {
+            echo "# Issue 列表（由 GitHub Actions 自动生成，请勿手动编辑）"
+            echo ""
+            echo "> 每次 Issue 变更（打开/编辑/关闭等）自动更新。运行时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo ""
+            echo "---"
+            echo ""
+          } > "$OUT"
+
+          # 统计
+          OPEN_N=$(gh issue list --repo "$REPO" --state open --limit 100 --json number --jq 'length')
+          echo "当前 Open Issue 数量：**${OPEN_N}**" >> "$OUT"
+          echo "" >> "$OUT"
+
+          if [ "$OPEN_N" -eq 0 ]; then
+            echo "*（暂无未处理的 Issue）*" >> "$OUT"
+          else
+            # 逐个导出（标题 / 状态 / 作者 / 标签 / 创建时间 / 正文）
+            for n in $(gh issue list --repo "$REPO" --state open --limit 100 --json number --jq '.[].number'); do
+              {
+                echo "## #$n $(gh issue view "$n" --repo "$REPO" --json title --jq '.title')"
+                echo ""
+                gh issue view "$n" --repo "$REPO" --json author,createdAt,state,labels \
+                  --jq '"| 字段 | 值 |\n| --- | --- |\n| 状态 | \(.state) |\n| 作者 | \(.author.login) |\n| 创建时间 | \(.createdAt) |\n| 标签 | \([.labels[].name] // [] | join(", ")) |"'
+                echo ""
+                echo "### 内容"
+                echo ""
+                gh issue view "$n" --repo "$REPO" --json body --jq '.body // "(无正文)"'
+                echo ""
+                echo "---"
+                echo ""
+              } >> "$OUT"
+            done
+          fi
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          # 没有变化则不提交
+          if ! git diff --quiet -- ISSUES.md 2>/dev/null && git status --porcelain | grep -q ISSUES.md; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add ISSUES.md
+            git commit -m "docs: 自动更新 Issue 列表"
+            git push origin HEAD:"${GITHUB_REF#refs/heads/}"
+          else
+            echo "ISSUES.md 无变化，跳过提交"
+          fi
