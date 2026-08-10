@@ -4,7 +4,7 @@ name: Export Issues to File
 # 并自动提交推送。这样本地 pull 后即可直接查看 Issue 内容。
 on:
   issues:
-    types: [opened, edited, reopened, closed, deleted]
+    types: [opened, edited, commented, reopened, closed, deleted]
   workflow_dispatch: # 也可手动触发一次
 
 jobs:
@@ -65,13 +65,13 @@ jobs:
       - name: Commit and push
         run: |
           set -euo pipefail
-          # 没有变化则不提交
-          if ! git diff --quiet -- ISSUES.md 2>/dev/null && git status --porcelain | grep -q ISSUES.md; then
+          # 先暂存，未跟踪/修改都会进入 staged；若无实际差异则跳过
+          git add ISSUES.md
+          if git diff --cached --quiet; then
+            echo "ISSUES.md 无变化，跳过提交"
+          else
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add ISSUES.md
             git commit -m "docs: 自动更新 Issue 列表"
-            git push origin HEAD:"${GITHUB_REF#refs/heads/}"
-          else
-            echo "ISSUES.md 无变化，跳过提交"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
