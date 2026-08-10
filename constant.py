@@ -2,7 +2,7 @@
 import os
 import sys
 
-VERSION = "v1.4"
+VERSION = "v1.5"
 AUTHOR = "Lzdqesj"
 
 SCREEN_WIDTH, SCREEN_HEIGHT = 1300, 700
