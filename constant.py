@@ -64,6 +64,9 @@ TEAM_COLORS = {
     'BLUE': {'main': BLUE, 'light': LIGHT_BLUE, 'name': '蓝方'}
 }
 
+# 攻击范围标记颜色（自己可攻击到敌人的节点 / 敌人节点上所需范围档位数）
+ATTACK_MARK_COLOR = (230, 70, 230)
+
 # 游戏状态
 STATE_MENU = 'menu'
 STATE_PLAYING = 'playing'

@@ -1154,6 +1154,7 @@ class Game:
         weakened = preview['weakened']
 
         # 1. 被切断的对方树枝（虚线高亮）
+        dash_draw = getattr(self, '_draw_dashed_line', None)
         for child in preview['hit_branches']:
             parent = child.parent
             if parent is None:
@@ -1166,8 +1167,13 @@ class Game:
                 w = 2
             else:
                 continue
-            self._draw_dashed_line(surface, (parent.x, parent.y),
-                                   (child.x, child.y), col, dash_len=6, gap_len=4, width=w)
+            if dash_draw is not None:
+                dash_draw(surface, (parent.x, parent.y),
+                          (child.x, child.y), col, dash_len=6, gap_len=4, width=w)
+            else:
+                # 防御：万一 _draw_dashed_line 不存在，退化为实线，避免崩溃
+                pygame.draw.line(surface, col[:3], (int(parent.x), int(parent.y)),
+                                 (int(child.x), int(child.y)), w)
 
         # 2. 被削弱的节点：橙色光圈
         for nid in weakened:
@@ -1198,11 +1204,69 @@ class Game:
                                             NODE_RADIUS + 10, 4)
                     break
 
+    # ===== 攻击范围标记 =====
+
+    def _attack_range_index(self, fx, fy, ex, ey):
+        """计算从 (fx,fy) 放置新节点，树枝恰好能穿过 (ex,ey) 所需的最小范围档位。
+
+        0 = 默认范围(120)即可直达(直接攻击到)，3 = 需要最大范围(240)。
+        返回 None 表示最大范围也够不到。
+        """
+        d = math.hypot(ex - fx, ey - fy)
+        for i, r in enumerate(RANGE_OPTIONS):
+            if d <= r:
+                return i
+        return None
+
+    def _compute_attack_marks(self, team):
+        """计算己方可攻击到敌人的节点，以及每个可被攻击的敌人所需的最小范围档位。
+
+        返回 (attackers: set[int], enemy_marks: dict[int, int])
+            attackers:  己方可以攻击到至少一个敌人的节点 id 集合
+            enemy_marks: 敌人节点 id → 所需最小范围档位(0~3)
+        """
+        attackers = set()
+        enemy_marks = {}
+        my_nodes = [n for n in self.nodes if n.team == team and n.can_have_child()]
+        enemy_nodes = [n for n in self.nodes if n.team != team]
+        for m in my_nodes:
+            best = None
+            for e in enemy_nodes:
+                ri = self._attack_range_index(m.x, m.y, e.x, e.y)
+                if ri is None:
+                    continue
+                if e.id not in enemy_marks or ri < enemy_marks[e.id]:
+                    enemy_marks[e.id] = ri
+                if best is None or ri < best:
+                    best = ri
+            if best is not None:
+                attackers.add(m.id)
+        return attackers, enemy_marks
+
+    def _draw_attack_marks(self, surface, team):
+        """绘制攻击范围标记：
+        - 己方可攻击的节点：外侧一个 ATTACK_MARK_COLOR 圆环
+        - 可被攻击的敌人节点：数字显示所需最小范围档位(0~3)
+        """
+        attackers, enemy_marks = self._compute_attack_marks(team)
+        # 己方可攻击节点：圆环标记
+        for n in self.nodes:
+            if n.team == team and n.id in attackers:
+                _draw_aa_circle_outline(surface, ATTACK_MARK_COLOR,
+                                        (int(n.x), int(n.y)), NODE_RADIUS + 10, 2)
+        # 敌人节点：数字
+        for n in self.nodes:
+            if n.team != team and n.id in enemy_marks:
+                num = enemy_marks[n.id]
+                txt = font_tiny.render(str(num), True, ATTACK_MARK_COLOR)
+                surface.blit(txt, txt.get_rect(center=(int(n.x), int(n.y) - NODE_RADIUS - 10)))
+
     @staticmethod
     def _point_in_range(px, py, node, radius):
+        """判断点是否在节点 radius 范围内（含浮点容差，吸附到边界时也能判定成功）。"""
         dx = px - node.x
         dy = py - node.y
-        return dx * dx + dy * dy <= radius * radius
+        return dx * dx + dy * dy <= radius * radius + 1e-6
 
     @staticmethod
     def _point_to_segment_dist(px, py, x1, y1, x2, y2):
@@ -1500,6 +1564,10 @@ class Game:
                           and node.can_have_child()
                           and not self.has_created_this_turn)
             node.draw(surface, emphasized=emphasized)
+
+        # 攻击范围标记（己方可攻击的节点 + 敌人节点所需范围档位数字）
+        if not self.dragging and not self.has_created_this_turn:
+            self._draw_attack_marks(surface, self.current_team)
 
         # 切割预览（在节点上方绘制，避免被遮挡）
         if preview is not None:
@@ -2303,36 +2371,7 @@ class Game:
             if winner:
                 play_sfx('victory' if self.my_team == winner else 'heavy_hit')
 
-            # 切割后自动降级：回收点数
-            if (not winner and strength >= 3
-                    and (removed_ids or weakened)):
-                own_root = None
-                for n in self.nodes:
-                    if n.team == self.current_team and n.parent is None:
-                        own_root = n
-                        break
-                is_defensive = (
-                    own_root
-                    and math.hypot(new_node.x - own_root.x,
-                                   new_node.y - own_root.y) <= 240)
-                target_strength = 2 if is_defensive else 1
-                if new_node.strength > target_strength:
-                    levels_down = new_node.strength - target_strength
-                    old_str = new_node.strength
-                    new_node.strength = target_strength
-                    self.points[self.current_team] += levels_down
-                    self.replay.record(
-                        'modify_branch', team=self.current_team,
-                        node_id=new_node.id,
-                        old_strength=old_str,
-                        new_strength=target_strength)
-                    if self.network_mode == 'host':
-                        import network_protocol as proto
-                        self._broadcast(proto.ACT_UPDATE_STRENGTH,
-                                        new_node.id, new_node.strength)
-                        self._broadcast_state_changed()
-                    play_sfx('tap', strength=target_strength)
-
+            # 不再允许切割后自动降级回收点数（人类不能降价，AI 也应遵守相同规则）
             self.has_created_this_turn = True
         elif action['type'] == 'modify_branch':
             node = action['node']
@@ -2697,11 +2736,26 @@ class Game:
             self._last_replay_click_time = 0
 
     def _do_replay_delete(self):
-        """删除当前选中的回放文件（移入 deleted 目录）。"""
+        """删除当前选中的回放文件（移入 deleted 目录）。
+
+        防御性处理：空列表 / 文件在磁盘上已不存在 / 索引越界时都不会崩溃。
+        """
         if not self._replay_files:
             return
+        if not (0 <= self._replay_selected < len(self._replay_files)):
+            self._replay_selected = 0
+            if not self._replay_files:
+                return
         fname = self._replay_files[self._replay_selected][0]
         src = os.path.join(os.path.dirname(__file__), 'replays', fname)
+        if not os.path.isfile(src):
+            # 文件在磁盘上已不存在：仅从列表移除，不执行移动
+            del self._replay_files[self._replay_selected]
+            play_sfx('shear')
+            if self._replay_files:
+                self._replay_selected = min(self._replay_selected,
+                                            len(self._replay_files) - 1)
+            return
         del_dir = os.path.join(os.path.dirname(__file__), 'replays', 'deleted')
         os.makedirs(del_dir, exist_ok=True)
         dst = os.path.join(del_dir, fname)
@@ -2709,7 +2763,8 @@ class Game:
         del self._replay_files[self._replay_selected]
         play_sfx('shear')
         if self._replay_files:
-            self._replay_selected = min(self._replay_selected, len(self._replay_files) - 1)
+            self._replay_selected = min(self._replay_selected,
+                                        len(self._replay_files) - 1)
 
     def _start_replay(self, filename):
         """加载回放文件，分组为步骤，构建初始棋盘。"""
