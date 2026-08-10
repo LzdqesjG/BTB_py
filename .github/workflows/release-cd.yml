@@ -23,7 +23,7 @@ jobs:
       - name: Parse tag info
         id: tag_info
         run: |
-          set -euo pipefail
+          set -uo pipefail
           TAG="${{ github.ref_name }}"          # 例如 v1.0.1-p-r
           VERSION="${TAG#v}"                   # 去掉 v → 1.0.1-p-r
           if [[ "$VERSION" == *-p-r ]]; then
@@ -39,7 +39,7 @@ jobs:
       - name: Extract commit message
         id: commit_msg
         run: |
-          set -euo pipefail
+          set -uo pipefail
           MSG=$(git log -1 --pretty=format:%B)
           echo "body<<EOF" >> $GITHUB_OUTPUT
           echo "$MSG" >> $GITHUB_OUTPUT
@@ -48,12 +48,11 @@ jobs:
       # 4. 打包整个项目（含子模块）为 tar.gz
       - name: Create source tarball
         run: |
-          set -euo pipefail
+          set -uo pipefail
           VERSION="${{ steps.tag_info.outputs.version }}"
           tar -czf "project-${VERSION}.tar.gz" \
             --exclude=.git \
             --exclude=.github \
-            --warning=no-file-changed \
             .
 
       # 5. 创建 Release 并上传压缩包（完全自定义）
