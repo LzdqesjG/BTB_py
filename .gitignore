@@ -9,13 +9,13 @@ Packages/
 
 # Log files
 *.log
+logs/*
+logs/
 
 # Test files
 tests/
 
 # Replay files
-replay/*
+replays/*
+replays/deleted/*
 *.bpr
-
-# ???
-mianer.py

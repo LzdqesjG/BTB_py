@@ -5,6 +5,24 @@ import sys
 import os
 import shutil
 import random
+import logging
+
+logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(message)s")
+log:logging.Logger = logging.getLogger("BTB")
+
+# 日志文件：logs/[启动时间]a.log，重名时改为 b, c, d...
+_log_dir = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(_log_dir, exist_ok=True)
+from datetime import datetime as _dt
+_log_base = _dt.now().strftime("%Y%m%d_%H%M%S")
+for _letter in "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+-":
+    _try = os.path.join(_log_dir, f"{_log_base}_{_letter}.log")
+    if not os.path.isfile(_try):
+        _log_path = _try
+        break
+_fh = logging.FileHandler(_log_path, encoding='utf-8')
+_fh.setFormatter(logging.Formatter("[%(asctime)s %(levelname)s] %(message)s"))
+log.addHandler(_fh)
 
 from constant import *
 
@@ -13,19 +31,26 @@ from replay import ReplayRecorder
 
 pygame.init()
 
+rprint = print
+def print(*values: object, sep: str | None = " ", end: str | None = "\n") -> None:
+    # rprint(*values, sep, end, file, flush)
+    log.info(sep.join(map(str, values)))
+
+
 _sfx_bank = {}         # {filename: Sound}
 # 通用调试日志池: [(text, color, tick, duration_ms), ...]
 _debug_entries = []
 DEFAULT_DEBUG_DURATION = 2000  # 默认显示时长(ms)
 DEBUG_MODE = os.path.isfile(os.path.join(os.path.dirname(__file__), 'debug'))
 DEBUGS = []
-with open('debug', 'r', encoding='utf-8') as f:
-    debug_mode = f.read().splitlines()
-    for line in debug_mode:
-        line = line.strip()
-        if line and not line.startswith('#'):
-            DEBUGS.append(line)
-print("[DEBUG] 已激活的调试选项: " + ", ".join(DEBUGS))
+if DEBUG_MODE:
+    with open('debug', 'r', encoding='utf-8') as f:
+        debug_mode = f.read().splitlines()
+        for line in debug_mode:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                DEBUGS.append(line)
+log.debug("已激活的调试选项: " + ", ".join(DEBUGS))
 
 
 def _load_all_sfx():
@@ -55,7 +80,7 @@ def _play_file(fname: str):
         snd.play()
         if DEBUG_MODE:
             fname_short = fname.rsplit('.', 1)[0]  # 去扩展名
-            add_debug_log(f"[DEBUG] Sound - {fname_short}", (-1, -1, -1))
+            add_debug_log(f"Sound - {fname_short}", (-1, -1, -1))
 
 
 def add_debug_log(text, color=(-1, -1, -1), duration_ms=None):
@@ -68,10 +93,13 @@ def add_debug_log(text, color=(-1, -1, -1), duration_ms=None):
         color = randcolor("noblack")
     if not DEBUG_MODE:
         return
+    texter = f"[DEBUG] {text}"
     tick = pygame.time.get_ticks()
     dur = duration_ms if duration_ms is not None else DEFAULT_DEBUG_DURATION
-    _debug_entries.append((text, color, tick, dur))
+    _debug_entries.append((texter, color, tick, dur))
+    log.debug(text)
 
+# log.addHandler(add_debug_log)
 
 def draw_debug_logs(surface, font=None, padding_x=10, padding_bottom=20, gap=16,
                     filter_tags=None):
@@ -188,7 +216,7 @@ def _draw_aa_circle_outline(surface, color, center, radius, width=1):
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption(f"Binary Tree Battle - {VERSION}")
 clock = pygame.time.Clock()
-add_debug_log("[DEBUG] 调试模式已激活, 调试选项:", (-1, -1, -1), 3000)
+add_debug_log("调试模式已激活, 调试选项:", (-1, -1, -1), 3000)
 for i in DEBUGS:
     add_debug_log(f" - {i}", (-1, -1, -1), 3000)
 play_sfx('victory')
@@ -486,6 +514,7 @@ class Game:
             new_node.id = node_id
             parent.children.append(new_node)
             self.nodes.append(new_node)
+            play_sfx('tap', strength=strength)
         elif cmd == proto.ACT_REMOVE_NODES:
             ids_to_remove = {int(pid) for pid in params}
             if not ids_to_remove:
@@ -510,6 +539,7 @@ class Game:
             node = self._node_by_id(node_id)
             if node is not None:
                 node.strength = new_strength
+                play_sfx('tap', strength=new_strength)
         elif cmd == proto.ACT_SYNC_TURN:
             self.current_team = params[0]
             self.has_created_this_turn = params[1] == 'True'
@@ -664,7 +694,7 @@ class Game:
             if self.network_mode != 'client':
                 fname = self.replay.save()
                 if fname:
-                    add_debug_log(f"[DEBUG] Replay saved: {fname}", (-1, -1, -1), 3000)
+                    add_debug_log(f"Replay saved: {fname}", (-1, -1, -1), 3000)
             return
 
         if self.state == STATE_REPLAY_PLAY:
