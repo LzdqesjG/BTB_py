@@ -2,8 +2,7 @@ name: Create Release ZIP
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: [ 'v*' ]
   workflow_dispatch:
 
 jobs:
@@ -13,55 +12,50 @@ jobs:
       contents: write
 
     steps:
-      # 1. 检出代码（含所有子模块）
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # 2. 解析标签，提取版本号和预发布标志
       - name: Parse tag info
         id: tag_info
         run: |
-          set -uo pipefail
-          TAG="${{ github.ref_name }}"          # 例如 v1.0.1-p-r
-          VERSION="${TAG#v}"                   # 去掉 v → 1.0.1-p-r
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
           if [[ "$VERSION" == *-p-r ]]; then
             PRERELEASE="true"
-            VERSION="${VERSION%-p-r}"          # 去掉 -p-r → 1.0.1
+            VERSION="${VERSION%-p-r}"
           else
             PRERELEASE="false"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
 
-      # 3. 提取当前 Commit 的完整内容作为 Release 描述
       - name: Extract commit message
         id: commit_msg
         run: |
-          set -uo pipefail
+          set -euo pipefail
           MSG=$(git log -1 --pretty=format:%B)
           echo "body<<EOF" >> $GITHUB_OUTPUT
           echo "$MSG" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      # 4. 打包整个项目（含子模块）为 tar.gz
-      - name: Create source tarball
+      # 使用 zip 代替 tar，避免“file changed”报错
+      - name: Create source archive
         run: |
-          set -uo pipefail
+          set -euo pipefail
           VERSION="${{ steps.tag_info.outputs.version }}"
-          tar -czf "project-${VERSION}.tar.gz" \
-            --exclude=.git \
-            --exclude=.github \
-            .
+          zip -r "project-${VERSION}.zip" . \
+            -x ".git/*" \
+            -x ".github/*"
 
-      # 5. 创建 Release 并上传压缩包（完全自定义）
       - name: Create Release and upload asset
         uses: softprops/action-gh-release@v1
         with:
-          name: "${{ steps.tag_info.outputs.version }}"          # Release 标题
-          body: ${{ steps.commit_msg.outputs.body }}             # 描述
-          prerelease: ${{ steps.tag_info.outputs.prerelease }}   # 预发布标志
-          draft: false                                           # 直接发布（或设为 true 保留草稿）
-          files: project-*.tar.gz                                # 上传压缩包
-          token: ${{ secrets.GITHUB_TOKEN }}                     # 自动注入，无需手动配置
+          name: "${{ steps.tag_info.outputs.version }}"
+          body: ${{ steps.commit_msg.outputs.body }}
+          prerelease: ${{ steps.tag_info.outputs.prerelease }}
+          draft: false
+          files: project-*.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
