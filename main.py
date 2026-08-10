@@ -397,7 +397,7 @@ class Game:
         self._ai_mode = False
         self._ai_team = None          # AI 控制的队伍
         self._ai_think_timer = 0
-        self._AI_THINK_DELAY = 90  # ~1.5 秒思考时间
+        self._AI_THINK_DELAY = AI_THINK_DELAY
         self._ai_debug_candidates = []  # AI 候选可视化数据
         self._ai_memory = {}          # AI 跨回合记忆
         self._ai_post_reinforce = 0   # 本回合放置后已强化的次数
@@ -842,27 +842,28 @@ class Game:
         dist_sq = (closest_x - cx) ** 2 + (closest_y - cy) ** 2
         return dist_sq <= radius * radius
 
-    @staticmethod
-    def _draw_dashed_line(surface, p1, p2, color, dash_len=8, gap_len=6, width=1):
-        """绘制虚线。color 支持 RGBA 元组（含透明度）。"""
-        x1, y1 = p1
-        x2, y2 = p2
-        dx, dy = x2 - x1, y2 - y1
-        total = math.hypot(dx, dy)
-        if total < 1:
-            return
-        ux, uy = dx / total, dy / total
-        seg = dash_len + gap_len
-        drawn = 0.0
-        while drawn < total:
-            start_x = x1 + ux * drawn
-            start_y = y1 + uy * drawn
-            end = min(dash_len, total - drawn)
-            end_x = x1 + ux * (drawn + end)
-            end_y = y1 + uy * (drawn + end)
-            pygame.draw.line(surface, color, (int(start_x), int(start_y)),
-                             (int(end_x), int(end_y)), width)
-            drawn += seg
+    # ===== AI 候选可视化（已注释） =====
+    # @staticmethod
+    # def _draw_dashed_line(surface, p1, p2, color, dash_len=8, gap_len=6, width=1):
+    #     """绘制虚线。color 支持 RGBA 元组（含透明度）。"""
+    #     x1, y1 = p1
+    #     x2, y2 = p2
+    #     dx, dy = x2 - x1, y2 - y1
+    #     total = math.hypot(dx, dy)
+    #     if total < 1:
+    #         return
+    #     ux, uy = dx / total, dy / total
+    #     seg = dash_len + gap_len
+    #     drawn = 0.0
+    #     while drawn < total:
+    #         start_x = x1 + ux * drawn
+    #         start_y = y1 + uy * drawn
+    #         end = min(dash_len, total - drawn)
+    #         end_x = x1 + ux * (drawn + end)
+    #         end_y = y1 + uy * (drawn + end)
+    #         pygame.draw.line(surface, color, (int(start_x), int(start_y)),
+    #                          (int(end_x), int(end_y)), width)
+    #         drawn += seg
 
     def _collect_subtree(self, root_node):
         """收集以 root_node 为根的所有后代节点（含 root_node 自己）。"""
@@ -1508,31 +1509,31 @@ class Game:
         for popup in self.score_popups:
             popup.draw(surface)
 
-        # ===== AI 候选可视化 =====
-        if self._ai_debug_candidates:
-            max_score = max(s for _, s in self._ai_debug_candidates)
-            max_score = max(max_score, 1.0)  # 避免除零
-            for action, score in self._ai_debug_candidates:
-                parent = action['parent']
-                x, y = action['x'], action['y']
-                strength = action['strength']
-                alpha = int(80 + 100 * (score / max_score))  # 80~180 透明度
-                # 连线：半透明虚线
-                self._draw_dashed_line(surface, (parent.x, parent.y), (x, y),
-                                       (255, 255, 120, alpha), dash_len=8, gap_len=6, width=1)
-                # 候选节点小圆
-                r = NODE_RADIUS * 0.5 + strength * 0.5
-                color = TEAM_COLORS[self.current_team]['main']
-                # 外圈
-                pygame.draw.circle(surface, (*color[:3], alpha),
-                                   (int(x), int(y)), int(r), 1)
-                # 填充
-                pygame.draw.circle(surface, (*color[:3], alpha // 3),
-                                   (int(x), int(y)), int(r - 1))
-                # 评分数字
-                s_txt = font_tiny.render(str(int(score)), True,
-                                         (255, 255, 180, alpha))
-                surface.blit(s_txt, s_txt.get_rect(center=(x, y - r - 8)))
+        # ===== AI 候选可视化（已注释） =====
+        # if self._ai_debug_candidates:
+        #     max_score = max(s for _, s in self._ai_debug_candidates)
+        #     max_score = max(max_score, 1.0)  # 避免除零
+        #     for action, score in self._ai_debug_candidates:
+        #         parent = action['parent']
+        #         x, y = action['x'], action['y']
+        #         strength = action['strength']
+        #         alpha = int(80 + 100 * (score / max_score))  # 80~180 透明度
+        #         # 连线：半透明虚线
+        #         self._draw_dashed_line(surface, (parent.x, parent.y), (x, y),
+        #                                (255, 255, 120, alpha), dash_len=8, gap_len=6, width=1)
+        #         # 候选节点小圆
+        #         r = NODE_RADIUS * 0.5 + strength * 0.5
+        #         color = TEAM_COLORS[self.current_team]['main']
+        #         # 外圈
+        #         pygame.draw.circle(surface, (*color[:3], alpha),
+        #                            (int(x), int(y)), int(r), 1)
+        #         # 填充
+        #         pygame.draw.circle(surface, (*color[:3], alpha // 3),
+        #                            (int(x), int(y)), int(r - 1))
+        #         # 评分数字
+        #         s_txt = font_tiny.render(str(int(score)), True,
+        #                                  (255, 255, 180, alpha))
+        #         surface.blit(s_txt, s_txt.get_rect(center=(x, y - r - 8)))
 
         # ===== HUD 顶部信息 =====
         # 红方信息
