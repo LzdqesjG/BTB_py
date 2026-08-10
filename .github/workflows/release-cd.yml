@@ -1,0 +1,61 @@
+name: Create Release ZIP
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Parse tag info
+        id: tag_info
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          if [[ "$VERSION" == *-p-r ]]; then
+            PRERELEASE="true"
+            VERSION="${VERSION%-p-r}"
+          else
+            PRERELEASE="false"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
+
+      - name: Extract commit message
+        id: commit_msg
+        run: |
+          set -euo pipefail
+          MSG=$(git log -1 --pretty=format:%B)
+          echo "body<<EOF" >> $GITHUB_OUTPUT
+          echo "$MSG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      # 使用 zip 代替 tar，避免“file changed”报错
+      - name: Create source archive
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.tag_info.outputs.version }}"
+          zip -r "project-${VERSION}.zip" . \
+            -x ".git/*" \
+            -x ".github/*"
+
+      - name: Create Release and upload asset
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "${{ steps.tag_info.outputs.version }}"
+          body: ${{ steps.commit_msg.outputs.body }}
+          prerelease: ${{ steps.tag_info.outputs.prerelease }}
+          draft: false
+          files: project-*.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
