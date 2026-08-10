@@ -7,7 +7,7 @@ import shutil
 import random
 import logging
 
-from AI.aithink3 import AIThinker
+from AI.aithink4 import AIThinker
 
 logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(message)s")
 log:logging.Logger = logging.getLogger("BTB")

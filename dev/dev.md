@@ -21,7 +21,7 @@
   - [game_server.py - 服务端](#game_serverpy---服务端)
   - [game_client.py - 客户端](#game_clientpy---客户端)
   - [anti_cheat.py - 反作弊](#anti_cheatpy---反作弊)
-  - [AI/aithink3.py - AI 系统](#aiaithink3py---ai-系统)
+  - [AI/aithink4.py - AI 系统](#aiaithink4py---ai-系统)
   - [replay.py - 回放系统](#replaypy---回放系统)
 - [联机架构](#联机架构)
   - [网络拓扑](#网络拓扑)
@@ -110,7 +110,8 @@ BTB_py/
 │   └── ai_default.json      # AI 默认参数（不可修改的初始版本）
 │
 ├── AI/
-│   ├── aithink3.py          # AI 决策引擎（当前生效版本，main.py 导入此模块）
+│   ├── aithink4.py          # AI 决策引擎（当前生效版本，main.py 导入此模块）
+│   ├── aithink3.py          # AI 旧版（被 aithink4 小幅调参迭代而来）
 │   ├── aithink2.py          # AI 旧版（早期移植版本）
 │   ├── aithink.py           # AI 旧版（最早移植版本）
 │   └── ai.json              # AI 运行时参数（为空时自动从 ai_default.json 复制）
@@ -129,7 +130,7 @@ BTB_py/
 
 | 文件 | 职责 | 依赖 |
 |------|------|------|
-| `main.py` | 游戏主入口；定义 `Node`、`PointPack`、`Game` 等核心类；处理全部 UI 渲染和事件 | `constant`, `replay`, `AI.aithink3` |
+| `main.py` | 游戏主入口；定义 `Node`、`PointPack`、`Game` 等核心类；处理全部 UI 渲染和事件 | `constant`, `replay`, `AI.aithink4` |
 | `constant.py` | 所有可配置常量、颜色、字体、音效路径；模块加载时读取 `config.json` | 标准库 `json/os` |
 | `config.json` | 游戏基础参数配置（AI 决策参数除外） | 被 `constant.py` 读取 |
 | `network_protocol.py` | 消息枚举、编解码、粘包处理、状态序列化 | `main`（通过 `resolve_module_class` 动态引用） |
@@ -137,9 +138,9 @@ BTB_py/
 | `game_client.py` | TCP 连接、状态接收、操作发送 | `network_protocol` |
 | `anti_cheat.py` | 服务端验证：回合、坐标、点数、频率、禁止降级 | `constant` |
 | `replay.py` | JSONL 格式对局记录、保存到 `replays/` | 无（仅标准库） |
-| `AI/aithink3.py` | 多策略 AI 决策引擎（当前生效） | `constant`, `assets/ai_default.json` |
-| `AI/ai.json` | AI 运行时参数（可热修改） | 被 `aithink3.py` 读取 |
-| `assets/ai_default.json` | AI 默认参数模板 | 被 `aithink3.py` 复制 |
+| `AI/aithink4.py` | 多策略 AI 决策引擎（当前生效） | `constant`, `assets/ai_default.json` |
+| `AI/ai.json` | AI 运行时参数（可热修改） | 被 `aithink4.py` 读取 |
+| `assets/ai_default.json` | AI 默认参数模板 | 被 `aithink4.py` 复制 |
 
 ***
 
@@ -320,7 +321,7 @@ while True:
 }
 ```
 
-> **注意**：`config.json` 只控制**基础游戏参数**。AI 决策评分参数在 `AI/ai.json`（由 `aithink3.py` 读取），两者互不干扰。
+> **注意**：`config.json` 只控制**基础游戏参数**。AI 决策评分参数在 `AI/ai.json`（由 `aithink4.py` 读取），两者互不干扰。
 
 ### network_protocol.py - 网络协议
 
@@ -391,9 +392,9 @@ while True:
 
 累计违规超过阈值可触发踢出（目前计数值保留，踢出逻辑预留）。
 
-### AI/aithink3.py - AI 系统
+### AI/aithink4.py - AI 系统
 
-**当前生效版本**：`main.py` 顶部 `from AI.aithink3 import AIThinker`。同目录的 `aithink.py` 和 `aithink2.py` 是早期移植版本（结构类似，但缺少后续增强功能），仅供对比参考。
+**当前生效版本**：`main.py` 顶部 `from AI.aithink4 import AIThinker`。同目录的 `aithink3.py`（前身）、`aithink2.py`、`aithink.py` 是早期移植版本（结构类似，但缺少后续增强功能），仅供对比参考。
 
 **入口**：`AIThinker(game).decide_action()` → 返回动作字典或 `None`。
 
@@ -427,12 +428,16 @@ while True:
 - **前向模拟**：对候选做 2 层贪心推演修正静态分
 - **思考延迟**：由 `config.json` 的 `ai.think_delay_frames` 控制（默认 90 帧 ≈ 1.5s），`main.py` 中 `_AI_THINK_DELAY = AI_THINK_DELAY`
 
+**aithink4 相对 aithink3 的调优**（吸取回放局教训）：
+- `max_move_cost` 从 2 → **1**：常规落子只允许 0~1 点开销，强制免费短步推进，把点数留给杀根窗口（回放 204717/205605 教训）
+- 前线节点出生强度奖励：距离阈值 400 → **350**，每级奖励 60 → **120**：更贴近敌根才奖励，且出生即带强度，抵抗人类切强度 1 链
+
 **可配置参数**：全部通过 `assets/ai_default.json` 配置，运行时从 `AI/ai.json` 加载。修改 `ai.json` 后无需重启游戏即可生效（每局初始化时重新读取）。
 
 相关文件：
 - `AI/ai.json`：运行时配置，为空时自动从 `ai_default.json` 复制
 - `assets/ai_default.json`：出厂默认配置，含每个参数的注释说明
-- `AI/aithink.py` / `AI/aithink2.py`：早期版本（未被 main.py 引用）
+- `AI/aithink.py` / `AI/aithink2.py` / `AI/aithink3.py`：早期版本（未被 main.py 引用）
 
 ### replay.py - 回放系统
 
@@ -568,10 +573,10 @@ Client                           Server
 
 1. **快速调参**：直接修改 `AI/ai.json`，下次 AI 对局即生效
 2. **修改思考速度**：修改 `config.json` 的 `ai.think_delay_frames`（不影响 AI 决策质量，只改变"思考"耗时）
-3. **修改策略**：在 `AI/aithink3.py` 中修改 `decide_action()` 的决策优先级或添加新规则
+3. **修改策略**：在 `AI/aithink4.py` 中修改 `decide_action()` 的决策优先级或添加新规则
 4. **修改评分**：在 `score_target()` / `threat_penalty()` 中添加新的评分维度
 5. **添加参数**：在 `assets/ai_default.json` 中添加新参数（含 `_note` 注释），在 `AIThinker.__init__()` 中读取
-6. **切换 AI 版本**：把 `main.py` 顶部的 `from AI.aithink3 import AIThinker` 改为引用旧版模块（不推荐，仅回退时使用）
+6. **切换 AI 版本**：把 `main.py` 顶部的 `from AI.aithink4 import AIThinker` 改为引用旧版模块（不推荐，仅回退时使用）
 
 ### 增加新的网络消息
 
