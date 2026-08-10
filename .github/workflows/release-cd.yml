@@ -3,69 +3,70 @@ name: Create Release ZIP
 on:
   push:
     tags:
-      - 'v*'                
-  workflow_dispatch:        
+      - 'v*'                # 只响应 v 开头的标签
+  workflow_dispatch:        # 允许手动触发（方便测试）
 
 jobs:
   release:
     runs-on: ubuntu-latest
     permissions:
-      contents: write       
+      contents: write       # 必须，用于创建 Release 和上传附件
 
     steps:
-      
+      # 1. 检出代码（含子模块）
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      
+      # 2. 解析标签，提取版本号和预发布标志
       - name: Parse tag info
         id: tag_info
         run: |
-          set -euo pipefail   
+          set -euo pipefail   # 管道安全：任何命令失败则退出
           
-          TAG="${{ github.ref_name }}"          
-          VERSION="${TAG#v}"
+          TAG="${{ github.ref_name }}"          # 例如 v1.0.1-p-r
+          VERSION="${TAG#v}"                   # 去掉前缀 v → 1.0.1-p-r
           
           if [[ "$VERSION" == *-p-r ]]; then
             PRERELEASE="true"
-            VERSION="${VERSION%-p-r}"          
+            VERSION="${VERSION%-p-r}"          # 去掉 -p-r → 1.0.1
           else
             PRERELEASE="false"
           fi
           
-          
+          # 设置输出变量，供后续步骤使用
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "prerelease=$PRERELEASE" >> $GITHUB_OUTPUT
 
-      
+      # 3. 提取当前 Commit 的完整内容作为 Release 描述
       - name: Extract commit message
         id: commit_msg
         run: |
           set -euo pipefail
           
-          
+          # 获取完整提交信息（标题 + 正文）
           MSG=$(git log -1 --pretty=format:%B)
           
-          
+          # 使用 Heredoc 安全写入多行文本（保留换行和特殊字符）
           echo "body<<EOF" >> $GITHUB_OUTPUT
           echo "$MSG" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      
+      # 4. 创建 Release 并打包源代码（含子模块）
       - name: Create recursive source ZIP
         uses: espressif/release-zips-action@v1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           
-          
+          # 版本号 = 解析后的纯净版本（不带 v 和 -p-r）
           release_name: "${{ steps.tag_info.outputs.version }}"
           
-          
+          # 描述 = 完整的 Commit 信息
           release_body: ${{ steps.commit_msg.outputs.body }}
           
-          
+          # 预发布标志 = 根据标签结尾判断
           release_prerelease: ${{ steps.tag_info.outputs.prerelease }}
           
-          
+          # 直接发布，不保存为草稿（可改为 true 如果你需要）
+          release_draft: false
