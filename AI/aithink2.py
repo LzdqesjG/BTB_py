@@ -1,0 +1,1557 @@
+"""AI 决策引擎 —— 移植自 C++ BinaryTreeBattle 的 AI (src/ai.cpp)。
+
+两者的底层架构不同, 但游戏内核相同:
+  * 从己方节点拖出树枝生成新节点, 每个节点最多 2 个子节点;
+  * 新树枝穿过对方节点/树枝会削减其强度, 强度归零则整棵子树被删除;
+  * 新树枝穿过对方根节点 → 直接获胜;
+  * 点数 = 强度消耗 (strength-1) + 范围消耗 (range_index)。
+
+架构差异 (移植时做的适配):
+  * C++ 的 Node 区分 edgeStrength(边强度) / level(节点等级) / attack(攻击力),
+    攻击伤害 = 源节点 attack; 而 Python 的 Node.strength 同时充当"边强度"和
+    "节点防御", 且新树枝伤害 = 新节点 strength (见 Game._resolve_crossing)。
+    因此评分中攻击力 atk = 候选强度 str。
+  * C++ 范围用 MAX_D=120 + EXTRA_D=40, ext 成本; Python 用 RANGE_OPTIONS=
+    [120,160,200,240], range_index 即成本 —— 两者一一对应。
+  * C++ 拾取得分点靠"树枝掠过"; Python 靠"节点碰触点数包" (NODE_RADIUS+
+    PICKUP_RADIUS), 因此收集评分改为评估落点与点数包的距离。
+  * C++ 窗口 1000x700, 中心 (500,350); Python 窗口 1300x700, 中心 (650,350)。
+
+核心策略 (完全保留 C++ AI 的多维度评分体系):
+  * 局面动态分析 (analyze_situation) —— 根据节点/边/点数/威胁走廊/半场控制/
+    绕后缺口等动态调整进攻/扩张/防守/收集权重。
+  * 候选目标生成 (gen_targets) —— 朝敌根推进、侧翼、切敌节点、切边、收集、
+    环形扫描。
+  * 多维度静态评分 (score_target) —— 节点命中+枢纽价值(子树大小)、边击杀/
+    削弱、连击、朝敌根推进、中心控制、压制、扩张、防守纵深、母节点风险、
+    收集经济性、僵持放大、噪声。
+  * 威胁惩罚 (threat_penalty) —— 敌方可反击位置、贴近敌根非杀根落点、我方
+    防线暴露时的深入重罚。
+  * 强制杀根检测 (find_kill_move) —— 预算内可一步穿过敌根 → 直接取胜。
+  * 薄弱边强化 (choose_reinforce) —— 威胁走廊内的低强度边优先加固。
+  * 轻量前向模拟 (simulate_lookahead) —— 对 top 候选做"我落子→敌回应→我
+    再回应"的贪心推演, 修正静态分。
+  * 记忆 (memory) —— 上次落点被摧毁的位置不再重建 (打地鼠记忆), 连续无进
+    攻时放大攻击倾向。
+
+运行接口 (与 main.py 兼容):
+  AIThinker(game).decide_action() -> None | {
+      'type': 'place_node',   'parent': Node, 'x': float, 'y': float,
+                              'strength': int, 'range_index': int
+      'type': 'modify_branch','node': Node, 'new_strength': int
+      'type': 'end_turn'
+  }
+"""
+
+import json
+import math
+import os
+import random
+
+from constant import (
+    SCREEN_WIDTH, SCREEN_HEIGHT, PLAY_AREA_TOP, PLAY_MARGIN,
+    NODE_RADIUS, MIN_STRENGTH, MAX_STRENGTH, MAX_CHILDREN, RANGE_OPTIONS,
+    PICKUP_RADIUS,
+)
+
+# 运行时参数覆盖: 若存在 AI/ai.json, 加载并覆盖 AIConfig 默认值 (便于调参)。
+# 该文件由 dev/rl_evolve.py 的进化式强化训练生成。
+_AI_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ai.json')
+_JSON_OVERRIDE = {}
+if os.path.isfile(_AI_JSON):
+    try:
+        with open(_AI_JSON, 'r', encoding='utf-8') as _fh:
+            _JSON_OVERRIDE = json.load(_fh)
+    except Exception:
+        _JSON_OVERRIDE = {}
+
+# ============================================================
+# 常量 (由游戏常量推导, 保证与 anti_cheat / main 完全一致)
+# ============================================================
+# 最小相邻节点间距。
+# 本地放置 (main._try_create_node) 要求新节点与所有节点 (含父节点) 距离 >= NODE_RADIUS*2+4 = 40px;
+# 网络反作弊 (anti_cheat) 略宽松 (≈39.55px)。AI 取严格值 40, 保证两种路径都合法。
+MIN_SPACING = NODE_RADIUS * 2 + 4          # 40
+NEAR_NODE_DIST_SQ = MIN_SPACING * MIN_SPACING   # 1600
+
+# 有效放置区域 (anti_cheat 的校验边界)
+MIN_X = PLAY_MARGIN
+MAX_X = SCREEN_WIDTH - PLAY_MARGIN
+MIN_Y = PLAY_AREA_TOP + PLAY_MARGIN
+MAX_Y = SCREEN_HEIGHT - PLAY_MARGIN
+
+MAX_RANGE = RANGE_OPTIONS[-1]            # 240
+PICKUP_COLLECT_DIST = NODE_RADIUS + PICKUP_RADIUS   # 31: 节点碰包距离
+CENTER_X, CENTER_Y = SCREEN_WIDTH / 2.0, 350.0      # 地图中心
+
+_OCCUPY_BLOCK = 24.0      # 威胁检测: 我节点阻挡敌方延伸的判定半径
+
+
+# ============================================================
+# 几何工具 (与 main.py 的判定保持一致)
+# ============================================================
+def _dist(x1, y1, x2, y2):
+    return math.hypot(x2 - x1, y2 - y1)
+
+
+def _pt_seg_dist(px, py, x1, y1, x2, y2):
+    """点到线段的最短距离。"""
+    dx, dy = x2 - x1, y2 - y1
+    seg_sq = dx * dx + dy * dy
+    if seg_sq < 1e-9:
+        return math.hypot(px - x1, py - y1)
+    t = ((px - x1) * dx + (py - y1) * dy) / seg_sq
+    t = max(0.0, min(1.0, t))
+    cx, cy = x1 + t * dx, y1 + t * dy
+    return math.hypot(px - cx, py - cy)
+
+
+def _orient(a, b, c):
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _on_seg(a, b, c):
+    return (min(a[0], b[0]) - 1e-9 <= c[0] <= max(a[0], b[0]) + 1e-9 and
+            min(a[1], b[1]) - 1e-9 <= c[1] <= max(a[1], b[1]) + 1e-9)
+
+
+def _seg_cross(p1, p2, p3, p4):
+    """两线段严格相交 (共享端点不算穿过, 与 Game._segments_intersect 一致)。"""
+    o1 = _orient(p1, p2, p3)
+    o2 = _orient(p1, p2, p4)
+    o3 = _orient(p3, p4, p1)
+    o4 = _orient(p3, p4, p2)
+    return (o1 * o2 < 0) and (o3 * o4 < 0)
+
+
+def _seg_hits_circle(x1, y1, x2, y2, cx, cy, radius):
+    """线段 p1-p2 是否穿过以 (cx,cy) 为圆心、radius 为半径的圆。"""
+    return _pt_seg_dist(cx, cy, x1, y1, x2, y2) <= radius
+
+
+def _sector(dx, dy):
+    """把方向向量映射到 0..7 扇区 (每 45° 一格)。"""
+    return int(math.floor(math.atan2(dy, dx) / math.pi * 4.0) + 8) % 8
+
+
+def _range_index(dist):
+    """按距离求范围档位 cost (0..3); 超出最远范围返回 None。"""
+    for i, r in enumerate(RANGE_OPTIONS):
+        if dist <= r + 1e-6:
+            return i
+    return None
+
+
+# ============================================================
+# AI 配置参数 (移植自 C++ AIConfig)
+# ============================================================
+class AIConfig:
+    """所有可调权重, 与 C++ ai.h 的 AIConfig 一一对应。
+
+    默认值经过两阶段强化训练:
+      1) 从 17 局人类全胜回放中拟合特征权重 (dev/train_ai.py);
+      2) 进化式自对弈搜索进一步调优 (dev/rl_evolve.py)。
+    可用 AI/ai.json 覆盖任意字段 (运行时加载, 见模块顶部)。
+    """
+
+    def __init__(self):
+        # 攻击 (回放学习: 人类制胜移动切割枢纽 3.3x, 进化搜索进一步放大)
+        self.node_hit = 1532.97    # 命中敌方节点
+        self.hub_factor = 595.02   # 枢纽价值乘数 (子树越大越值钱)
+        self.edge_kill = 105.28    # 摧毁敌方边
+        self.edge_hit = 69.81      # 削弱敌方边
+        self.decisive2 = 207.66    # 一次打掉 >=2 目标
+        self.combo = 43.81         # 命中+穿越复合
+        self.str_bonus = 26.50     # 攻击时每级强度奖励
+        self.advance = 9.71        # 朝敌根推进乘数 (回放: 人类推进 78%)
+        # 发展
+        self.collect = 393.83      # 收集得分点 (回放: 人类收集 25x)
+        self.collect_low = 70.86   # 缺分时收集
+        self.expand = 0.24         # 开拓版图 (人类很少散开扩张)
+        self.center = 0.07         # 占领中心 (低优先)
+        self.defense = 2.36        # 防守纵深
+        # 资源管理
+        self.reserve_base = 2.48   # 保底积分基数
+        self.spend_open = 27.32    # 开局花费敏感度
+        self.spend_mid = 13.98     # 中后期花费敏感度 (人类花费仅随机 38%)
+        self.spend_tight = 7.90    # 积分紧张敏感度
+        self.extra_thresh = 414.62  # 额外行动触发阈值
+        self.threat_mul = 1.46     # 威胁惩罚系数
+        # 人类策略参数
+        self.reinf_budget = 0.42   # 强化预算占富余分比例
+        self.reinf_threat = 22.94  # 强化威胁门槛
+        self.sprint_dist = 275.78  # 冲刺区距离
+        self.sprint_bonus = 1.84   # 冲刺推进加成
+        self.extra_sprint = 210.82  # 额外行动冲刺触发距离
+        self.deep_push = 420.00    # 中距离大步推进距离
+        self.hub_preference = 1.20  # 枢纽击杀偏好
+        self.risk_taker = 1.12     # 冒险度
+        # ===== 回放强化训练学到的权重 (人类制胜策略: 链式冲刺 + 切割枢纽) =====
+        self.chain_bonus = 8.05    # 链式推进奖励: 落点沿"父→敌根"方向加分
+        # ===== 运行时覆盖 (AI/ai.json, 由 dev/rl_evolve.py 生成) =====
+        for _k, _v in _JSON_OVERRIDE.items():
+            if hasattr(self, _k):
+                try:
+                    setattr(self, _k, float(_v))
+                except (TypeError, ValueError):
+                    pass
+
+
+# ============================================================
+# 前向模拟用轻量节点 / 局面 (不依赖 pygame 的 Node 类)
+# ============================================================
+class _SimNode:
+    __slots__ = ('x', 'y', 'team', 'strength', 'parent', 'children')
+
+    def __init__(self, x, y, team, strength, parent=None):
+        self.x = x
+        self.y = y
+        self.team = team
+        self.strength = strength
+        self.parent = parent
+        self.children = []
+
+    def subtree(self):
+        cnt = 1
+        for c in self.children:
+            cnt += c.subtree()
+        return cnt
+
+
+class _SimState:
+    """浅克隆局面, 用于前向模拟。不模拟点数包精确生成, 只模拟切割/胜负。"""
+
+    def __init__(self, nodes, my_team, en_team):
+        self.map = {}
+        for n in nodes:
+            self.map[n] = _SimNode(n.x, n.y, n.team, n.strength)
+        for n in nodes:
+            sn = self.map[n]
+            if n.parent is not None and n.parent in self.map:
+                pn = self.map[n.parent]
+                sn.parent = pn
+                pn.children.append(sn)
+        self.all = list(self.map.values())
+        self.my_team = my_team
+        self.en_team = en_team
+        self.my_root = None
+        self.en_root = None
+        for sn in self.all:
+            if sn.parent is None:
+                if sn.team == my_team:
+                    self.my_root = sn
+                else:
+                    self.en_root = sn
+
+    def _remove_subtree(self, node):
+        dead = []
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            dead.append(cur)
+            for c in cur.children:
+                stack.append(c)
+        if node.parent is not None:
+            node.parent.children = [c for c in node.parent.children if c is not node]
+        for d in dead:
+            if d in self.all:
+                self.all.remove(d)
+        if node is self.my_root:
+            self.my_root = None
+        if node is self.en_root:
+            self.en_root = None
+
+    def apply(self, parent, tgt, str_, team):
+        """在模拟局面上放置一个新节点并结算切割。"""
+        if len(parent.children) >= MAX_CHILDREN:
+            return False
+        x, y = tgt
+        nd = _SimNode(x, y, team, str_, parent)
+        parent.children.append(nd)
+        self.all.append(nd)
+        enemy = self.en_team if team == self.my_team else self.my_team
+        src = (parent.x, parent.y)
+        # 穿过敌方节点
+        hits = []
+        for sn in self.all:
+            if sn.team == enemy:
+                if (sn.x == src[0] and sn.y == src[1]) or (sn.x == x and sn.y == y):
+                    continue
+                if _seg_hits_circle(src[0], src[1], x, y, sn.x, sn.y, NODE_RADIUS):
+                    hits.append(sn)
+        for sn in hits:
+            if sn.parent is None:
+                # 根节点被穿过 → 该方根移除 (胜负判定)
+                if sn is self.en_root:
+                    self.en_root = None
+                if sn is self.my_root:
+                    self.my_root = None
+                return True
+        # 穿过敌方边
+        edge_hits = []
+        for sn in self.all:
+            if sn.team == enemy and sn.parent is not None:
+                if _seg_cross(src, (x, y), (sn.parent.x, sn.parent.y), (sn.x, sn.y)):
+                    edge_hits.append(sn)
+        # 统一结算
+        to_kill = []
+        for sn in hits + edge_hits:
+            if sn not in self.all:
+                continue
+            sn.strength -= str_
+            if sn.strength <= 0:
+                to_kill.append(sn)
+        for sn in to_kill:
+            if sn in self.all:
+                self._remove_subtree(sn)
+        return True
+
+
+# ============================================================
+# AI 主类
+# ============================================================
+class AIThinker:
+    def __init__(self, game, cfg=None):
+        self.game = game
+        self.cfg = cfg if cfg is not None else AIConfig()
+        self.team = getattr(game, '_ai_team', None)
+        if self.team is None:
+            self.team = game.current_team
+        self.enemy_team = 'BLUE' if self.team == 'RED' else 'RED'
+        self.my_root = None
+        self.en_root = None
+        self.sit = None
+        self._rng = random.Random(20240810)
+        self.mem = self._memory()
+
+    # ---------- 记忆 ----------
+    def _memory(self):
+        mem = getattr(self.game, '_ai_memory', None)
+        if not isinstance(mem, dict):
+            mem = {}
+            self.game._ai_memory = mem
+        return mem
+
+    def _update_memory(self, nodes):
+        """检查上次落点是否已被摧毁, 若是则记入'打地鼠'禁区。"""
+        mem = self.mem
+        lp = mem.get('last_placed')
+        if lp:
+            found = any(n.team == self.team and abs(n.x - lp[0]) < 1.0
+                        and abs(n.y - lp[1]) < 1.0 for n in nodes)
+            if not found:
+                kt = mem.setdefault('killed_targets', [])
+                kt.append(lp)
+                if len(kt) > 6:
+                    kt.pop(0)
+        mem['last_placed'] = None
+
+    # ---------- 根节点查找 ----------
+    def _find_roots(self):
+        self.my_root = None
+        self.en_root = None
+        for n in self.game.nodes:
+            if n.parent is None:
+                if n.team == self.team:
+                    self.my_root = n
+                else:
+                    self.en_root = n
+                if self.my_root and self.en_root:
+                    return
+
+    # ============================================================
+    # 局面动态分析
+    # ============================================================
+    def analyze_situation(self):
+        nodes = self.game.nodes
+        my_root, en_root = self.my_root, self.en_root
+        my_score = self.game.points[self.team]
+        en_score = self.game.points[self.enemy_team]
+
+        class S:  # 局面快照
+            pass
+        s = S()
+        s.my_nodes = s.en_nodes = 0
+        s.my_avg_edge = s.en_avg_edge = 1.0
+        s.en_front_count = 0
+        my_edge_sum = en_edge_sum = 0.0
+        my_edge_cnt = en_edge_cnt = 0
+
+        for n in nodes:
+            if n.team == self.team:
+                s.my_nodes += 1
+                for c in n.children:
+                    my_edge_sum += c.strength
+                    my_edge_cnt += 1
+            else:
+                s.en_nodes += 1
+                for c in n.children:
+                    en_edge_sum += c.strength
+                    en_edge_cnt += 1
+                if len(n.children) < MAX_CHILDREN and \
+                        _dist(n.x, n.y, en_root.x, en_root.y) < 300:
+                    s.en_front_count += 1
+
+        s.my_avg_edge = my_edge_sum / my_edge_cnt if my_edge_cnt else 1.0
+        s.en_avg_edge = en_edge_sum / en_edge_cnt if en_edge_cnt else 1.0
+
+        # ---- 己方根 8 扇区防护缺口 (预防绕后) ----
+        sector_prot = [1e9] * 8
+        for n in nodes:
+            if n.team != self.team:
+                continue
+            d = _dist(n.x, n.y, my_root.x, my_root.y)
+            if d < 5:
+                continue
+            sec = _sector(n.x - my_root.x, n.y - my_root.y)
+            if d < sector_prot[sec]:
+                sector_prot[sec] = d
+        s.flank_gap = 0.0
+        s.flank_gap_angle = -1
+        for i, v in enumerate(sector_prot):
+            if v > s.flank_gap:
+                s.flank_gap = v
+                s.flank_gap_angle = i
+        s.flank_threat = False
+        if s.flank_gap_angle >= 0:
+            for n in nodes:
+                if n.team == self.team:
+                    continue
+                d = _dist(n.x, n.y, my_root.x, my_root.y)
+                if d > 280:
+                    continue
+                if _sector(n.x - my_root.x, n.y - my_root.y) == s.flank_gap_angle:
+                    s.flank_threat = True
+                    break
+
+        # ---- 敌方根缺口 (供主动绕后攻击) ----
+        en_sec_prot = [1e9] * 8
+        for n in nodes:
+            if n.team == self.team:
+                continue
+            d = _dist(n.x, n.y, en_root.x, en_root.y)
+            if d < 5:
+                continue
+            sec = _sector(n.x - en_root.x, n.y - en_root.y)
+            if d < en_sec_prot[sec]:
+                en_sec_prot[sec] = d
+        s.en_flank_gap = 0.0
+        s.en_flank_gap_angle = -1
+        for i, v in enumerate(en_sec_prot):
+            if v > s.en_flank_gap:
+                s.en_flank_gap = v
+                s.en_flank_gap_angle = i
+
+        # ---- 玩家行为倾向 (无在线学习数据时取中性; 可被外部写入覆盖) ----
+        s.player_aggression = 0.5
+        s.player_defense = 0.5
+        s.player_turtle = False
+
+        # ---- 双方是否尚未正面交锋 ----
+        nearest = 1e9
+        for n in nodes:
+            if n.team == self.team:
+                for m in nodes:
+                    if m.team != self.team:
+                        d = _dist(n.x, n.y, m.x, m.y)
+                        if d < nearest:
+                            nearest = d
+        s.no_contact = nearest > 260
+
+        # ---- 换位思考: 我方薄弱边 / 暴露节点 ----
+        s.my_weak_edges = 0
+        s.my_front_exposed = 0
+        for n in nodes:
+            if n.team != self.team:
+                continue
+            for c in n.children:
+                if c.strength > 1:
+                    continue
+                for en in nodes:
+                    if en.team == self.team or len(en.children) >= MAX_CHILDREN:
+                        continue
+                    d = _dist(en.x, en.y, c.x, c.y)
+                    if 20 < d < MAX_RANGE:
+                        s.my_weak_edges += 1
+                        break
+            for en in nodes:
+                if en.team == self.team or len(en.children) >= MAX_CHILDREN:
+                    continue
+                d = _dist(en.x, en.y, n.x, n.y)
+                if 20 < d < RANGE_OPTIONS[0]:
+                    s.my_front_exposed += 1
+                    break
+
+        # ---- 全局: 黄点资源优势 ----
+        s.score_pt_adv = 0.0
+        for sp in self.game.pickups:
+            my_best = en_best = 1e9
+            for n in nodes:
+                if len(n.children) >= MAX_CHILDREN:
+                    continue
+                d = _dist(n.x, n.y, sp.x, sp.y)
+                if n.team == self.team:
+                    if d < my_best:
+                        my_best = d
+                else:
+                    if d < en_best:
+                        en_best = d
+            if my_best < en_best - 40:
+                s.score_pt_adv += sp.value
+            elif en_best < my_best - 40:
+                s.score_pt_adv -= sp.value
+
+        # ---- 全局: 威胁走廊 (敌方节点逼近我根) ----
+        s.en_near_root = 0
+        for n in nodes:
+            if n.team == self.team:
+                continue
+            if _dist(n.x, n.y, my_root.x, my_root.y) < 250 and \
+                    len(n.children) < MAX_CHILDREN:
+                s.en_near_root += 1
+
+        # ---- 全局: 前线对比 (距敌根 < 300) ----
+        s.my_front_n = s.en_front_n = 0
+        s.my_front_edge = s.en_front_edge = 0.0
+        for n in nodes:
+            d_en = _dist(n.x, n.y, en_root.x, en_root.y)
+            if d_en < 300:
+                if n.team == self.team:
+                    s.my_front_n += 1
+                    for c in n.children:
+                        s.my_front_edge += c.strength
+                else:
+                    s.en_front_n += 1
+                    for c in n.children:
+                        s.en_front_edge += c.strength
+
+        # ---- 全局: 半场控制 (节点深入对方半场) ----
+        s.my_control = s.en_control = 0.0
+        for n in nodes:
+            d_my = _dist(n.x, n.y, my_root.x, my_root.y)
+            d_en = _dist(n.x, n.y, en_root.x, en_root.y)
+            if n.team == self.team:
+                if d_en < d_my:
+                    s.my_control += 1.0
+            else:
+                if d_my < d_en:
+                    s.en_control += 1.0
+
+        # ---- 全局: 敌方根威胁预警 / 根部盾牌 ----
+        s.en_min_dist = 1e9
+        s.en_probing = False
+        s.my_root_shield = 0
+        for n in nodes:
+            if n.team != self.team:
+                d = _dist(n.x, n.y, my_root.x, my_root.y)
+                if d < s.en_min_dist:
+                    s.en_min_dist = d
+            else:
+                if _dist(n.x, n.y, my_root.x, my_root.y) < 240:
+                    s.my_root_shield += 1
+        s.en_probing = s.en_min_dist < 260
+
+        s.en_score_ahead = en_score > my_score + 3
+        s.my_score = my_score
+        s.en_score = en_score
+        return s
+
+    # ============================================================
+    # 资源管理
+    # ============================================================
+    def compute_reserve(self, my_score, total_nodes):
+        """保底积分: 不能把分花光, 至少保留一次免费行动的能力。"""
+        reserve = 3
+        if total_nodes < 8:
+            reserve = min(5, 3 + my_score // 10)
+        elif my_score <= 5:
+            reserve = 2
+        else:
+            reserve = min(5, 3 + my_score // 12)
+        sit = self.sit
+        if sit.en_score_ahead:
+            reserve += 1
+        if sit.en_near_root >= 2:
+            reserve += 1
+        if sit.score_pt_adv < 0 and my_score < 8:
+            reserve += 1
+        if sit.flank_threat:
+            reserve += 1
+        # 僵持时几乎不留保底, 把分花在进攻/破局上
+        if self.mem.get('no_progress', 0) >= 3 and my_score >= 1:
+            reserve = min(reserve, 1)
+        # 杀根窗口预留: 己方可扩展节点已进入敌根 240 范围时, 保留发起杀根所需点数
+        # (修复回放 20260810_154845: AI 进入杀根窗口却因点数耗尽付不起 range-240 的失败)
+        en_root = self.en_root
+        if en_root is not None:
+            for n in self.game.nodes:
+                if n.team == self.team and len(n.children) < MAX_CHILDREN:
+                    d = _dist(n.x, n.y, en_root.x, en_root.y)
+                    kill_dist = d + 42.0   # 需越过根至少 42px
+                    if kill_dist <= MAX_RANGE:
+                        need = _range_index(kill_dist) or 0
+                        reserve = max(reserve, need)
+                        break
+        if my_score > 0:
+            return min(reserve, my_score)
+        return 0
+
+    def _spend_multiplier(self, my_score, total_nodes):
+        sit = self.sit
+        if sit.my_nodes < 4 or total_nodes < 8:
+            m = self.cfg.spend_open
+        elif my_score <= 5:
+            m = self.cfg.spend_tight
+        else:
+            m = self.cfg.spend_mid
+        if sit.en_score_ahead:
+            m *= 1.4
+        if sit.score_pt_adv < -3:
+            m *= 1.3
+        if sit.en_near_root >= 2 and my_score < 8:
+            m *= 1.3
+        return m
+
+    # ============================================================
+    # 动态策略权重 (随局面变化)
+    # ============================================================
+    def _dynamic_multipliers(self):
+        sit = self.sit
+        atk = exp = dfn = col = 1.0
+        # 僵持冲刺: 连续多回合落子但无战果 → 提高进攻倾向, 降低保守防守
+        if self.mem.get('no_progress', 0) >= 3:
+            atk *= 1.6
+            dfn *= 0.7
+            exp *= 0.8
+        if sit.player_aggression > 0.55:
+            dfn = 1.6
+        if sit.en_score > sit.my_score + 4:
+            atk = 1.3
+        if sit.my_nodes < sit.en_nodes:
+            exp = 1.5
+        if sit.en_avg_edge > 2.2:
+            atk *= 1.2
+        if sit.player_turtle:
+            atk *= 1.25
+        if sit.en_front_count > sit.my_nodes:
+            atk *= 1.1
+        if sit.flank_threat:
+            dfn *= 2.0
+        if sit.en_score >= 8:
+            dfn *= 1.7
+        if sit.en_score >= 12:
+            dfn *= 2.2
+        if sit.en_score >= 10 and sit.my_avg_edge < sit.en_avg_edge:
+            atk *= 0.8
+        if sit.no_contact:
+            col *= 2.5
+            atk *= 0.7
+        if sit.my_score < 6:
+            col *= 2.2
+        if sit.en_score > sit.my_score:
+            col *= 1.8
+        if sit.my_score < 10 and sit.en_score >= 8:
+            col *= 1.5
+        if sit.my_weak_edges >= 2:
+            atk *= 0.85
+        if sit.my_weak_edges >= 4:
+            atk *= 0.7
+        if sit.my_front_exposed >= 3:
+            atk *= 0.85
+        if sit.my_weak_edges >= 3 or sit.my_front_exposed >= 4:
+            dfn *= 1.5
+        if sit.score_pt_adv < 0:
+            col *= 1.6
+        if sit.score_pt_adv >= 4:
+            col *= 1.3
+        if sit.en_near_root >= 1:
+            dfn *= 1.4
+        if sit.en_near_root >= 3:
+            dfn *= 1.8
+        if sit.en_front_n > sit.my_front_n + 2:
+            atk *= 0.85
+        if sit.my_front_n == 0 and sit.en_front_n > 0:
+            dfn *= 1.5
+        if sit.en_front_edge > sit.my_front_edge * 1.5:
+            dfn *= 1.3
+        if sit.en_control > sit.my_control + 2:
+            dfn *= 1.5
+        if sit.en_score_ahead:
+            col *= 1.4
+        return atk, exp, dfn, col
+
+    # ============================================================
+    # 强制杀根检测
+    # ============================================================
+    def find_kill_move(self, nodes, my_score):
+        if self.my_root is None or self.en_root is None:
+            self._find_roots()
+        if self.sit is None:
+            self.sit = self.analyze_situation()
+        en_root = self.en_root
+        # 杀根是一击制胜, 值得花光所有点数 (不再受保底限制)
+        for n in nodes:
+            if n.team != self.team or len(n.children) >= MAX_CHILDREN:
+                continue
+            dx = en_root.x - n.x
+            dy = en_root.y - n.y
+            L = math.hypot(dx, dy)
+            if L < 25 or L > MAX_RANGE:
+                continue
+            ux, uy = dx / L, dy / L
+            # 根后方落点 (分支穿过根)。间距限制 ~40, 从 42 起步。
+            for extra in (42.0, 58.0, 74.0, 90.0):
+                d = L + extra
+                if d > MAX_RANGE:
+                    continue
+                tx, ty = n.x + ux * d, n.y + uy * d
+                if not self._in_bounds(tx, ty):
+                    continue
+                if self._occupied(tx, ty, nodes, n):
+                    continue
+                ri = _range_index(d)
+                if ri is None:
+                    continue
+                if ri > my_score:
+                    continue
+                if _seg_hits_circle(n.x, n.y, tx, ty, en_root.x, en_root.y, NODE_RADIUS):
+                    return {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
+                            'strength': MIN_STRENGTH, 'range_index': ri}
+        return None
+
+    # ============================================================
+    # 候选目标生成 (有界, 控制性能)
+    # ============================================================
+    def gen_targets(self, parent, nodes, en_root, pickups, light=False):
+        out = []
+        px, py = parent.x, parent.y
+
+        def push(x, y):
+            out.append((x, y))
+
+        dx = en_root.x - px
+        dy = en_root.y - py
+        d = math.hypot(dx, dy)
+        if d > 1:
+            ux, uy = dx / d, dy / d
+            for dist in (35, 55, 75, 95, 115, 140, 165, 195, 225):
+                push(px + ux * dist, py + uy * dist)
+            for ang in (-0.5, 0.5, -0.28, 0.28, -0.12, 0.12, -0.75, 0.75):
+                cs, sn = math.cos(ang), math.sin(ang)
+                rx = ux * cs - uy * sn
+                ry = ux * sn + uy * cs
+                for dist in (70, 110, 150, 190, 230):
+                    push(px + rx * dist, py + ry * dist)
+
+        # 敌方节点周边 (切节点/拦截)
+        en_near = []
+        for n in nodes:
+            if n.team == self.team:
+                continue
+            ddx, ddy = n.x - px, n.y - py
+            L = math.hypot(ddx, ddy)
+            if L < 25 or L > MAX_RANGE + 20:
+                continue
+            en_near.append((L, n))
+        en_near.sort(key=lambda t: t[0])
+        for _, n in en_near[:6]:
+            ddx, ddy = n.x - px, n.y - py
+            L = math.hypot(ddx, ddy)
+            if L < 1:
+                continue
+            ux, uy = ddx / L, ddy / L
+            push(n.x, n.y)
+            for off in (-30, 30, -45, 45):
+                push(n.x - uy * off, n.y + ux * off)
+            if len(n.children) < MAX_CHILDREN:
+                push(n.x + ux * 35, n.y + uy * 35)
+
+        # 敌方节点与敌根中点 (切入路径)
+        for n in nodes:
+            if n.team == self.team or n.parent is None:
+                continue
+            mid = ((n.x + en_root.x) * 0.5, (n.y + en_root.y) * 0.5)
+            if 30 < _dist(mid[0], mid[1], px, py) < MAX_RANGE:
+                push(*mid)
+
+        # 点数包周边
+        for sp in pickups:
+            dsp = _dist(sp.x, sp.y, px, py)
+            if dsp < 18 or dsp > MAX_RANGE:
+                continue
+            push(sp.x, sp.y)
+            if dsp > 1:
+                ux = (sp.x - px) / dsp
+                uy = (sp.y - py) / dsp
+                push(sp.x - uy * 18, sp.y + ux * 18)
+                push(sp.x + uy * 18, sp.y - ux * 18)
+
+        # 环形扫描 (保障覆盖)
+        if not light and len(out) < 60:
+            ring_n = 16
+            for a in range(ring_n):
+                rad = a * 6.28318 / ring_n + self._rng.uniform(-0.1, 0.1)
+                for dist in (45, 75, 105, 140):
+                    push(px + math.cos(rad) * dist, py + math.sin(rad) * dist)
+
+        # 去重 + 截断 (保证单节点候选数受控)
+        seen = set()
+        result = []
+        for t in out:
+            key = (round(t[0] / 8.0), round(t[1] / 8.0))
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(t)
+            if len(result) >= (40 if light else 80):
+                break
+        return result
+
+    # ============================================================
+    # 合法性
+    # ============================================================
+    @staticmethod
+    def _in_bounds(x, y):
+        return (MIN_X <= x <= MAX_X) and (MIN_Y <= y <= MAX_Y)
+
+    @staticmethod
+    def _occupied(x, y, nodes, exclude):
+        for o in nodes:
+            if o is exclude:
+                continue
+            if (o.x - x) ** 2 + (o.y - y) ** 2 < NEAR_NODE_DIST_SQ:
+                return True
+        return False
+
+    def _valid_target(self, parent, tgt, nodes):
+        tx, ty = tgt
+        if not self._in_bounds(tx, ty):
+            return False
+        d = _dist(parent.x, parent.y, tx, ty)
+        if d < MIN_SPACING or d > MAX_RANGE:
+            return False
+        if self._occupied(tx, ty, nodes, parent):
+            return False
+        return True
+
+    # ============================================================
+    # 子树规模 (用于枢纽价值)
+    # ============================================================
+    def subtree_size(self, n):
+        cnt = 1
+        for c in n.children:
+            cnt += self.subtree_size(c)
+        return cnt
+
+    # ============================================================
+    # 多维度静态评分 (移植自 C++ scoreTarget)
+    # ============================================================
+    def score_target(self, parent, tgt, str_, range_index, spend_mult,
+                     dyn, en_nodes, en_edges, pickups):
+        dyn_atk, dyn_exp, dyn_dfn, dyn_col = dyn
+        cfg = self.cfg
+        sit = self.sit
+        my_root, en_root = self.my_root, self.en_root
+        src = (parent.x, parent.y)
+        tx, ty = tgt
+        cost = range_index + (str_ - MIN_STRENGTH)
+        atk = str_                      # Python: 新树枝伤害 = 新节点强度
+
+        s = 0.5
+        # 记忆: 朝上次落点方向轻微推进
+        last = self.mem.get('last_target')
+        if last:
+            s += _dist(tx, ty, last[0], last[1]) * 0.02
+
+        # 绕后补防: 缺口扇区方向建防线
+        if sit.flank_threat and sit.flank_gap_angle >= 0:
+            d_root = _dist(tx, ty, my_root.x, my_root.y)
+            if 50 < d_root < 240:
+                if _sector(tx - my_root.x, ty - my_root.y) == sit.flank_gap_angle:
+                    s += 28.0 * dyn_dfn
+        # 主动绕后: 朝敌方根缺口推进
+        if sit.en_flank_gap_angle >= 0:
+            d_en = _dist(tx, ty, en_root.x, en_root.y)
+            if 30 < d_en < 280:
+                if _sector(tx - en_root.x, ty - en_root.y) == sit.en_flank_gap_angle:
+                    s += 22.0 * dyn_atk
+
+        # ---- 收集 (Python: 节点碰包) ----
+        collected = False
+        collect_value = 0.0
+        for sp in pickups:
+            d = _dist(tx, ty, sp.x, sp.y)
+            if d < PICKUP_COLLECT_DIST:
+                collected = True
+                collect_value += sp.value
+                s += sp.value * (cfg.collect_low if spend_mult > 3 else cfg.collect) * dyn_col
+                s += sp.value * 5.0     # 黄点未来积分现值
+            elif d < 130:
+                s += sp.value * 2.0 * (1.0 - d / 130.0) * dyn_col
+        # 收集经济性: 花范围延长去够黄点必须物有所值
+        if range_index > 0 and collected and collect_value < range_index:
+            s -= (range_index - collect_value) * 20.0 * spend_mult
+
+        # ---- 节点命中 ----
+        nodes_hit = 0
+        hub_value = 0
+        hit_root = False
+        for n in en_nodes:
+            if (n.x == src[0] and n.y == src[1]) or (n.x == tx and n.y == ty):
+                continue
+            if _seg_hits_circle(src[0], src[1], tx, ty, n.x, n.y, NODE_RADIUS):
+                if n.parent is None:
+                    hit_root = True
+                    break
+                nodes_hit += 1
+                hub_value += self.subtree_size(n)
+        if hit_root:
+            return 10000.0
+
+        # ---- 边命中 ----
+        edges_hit = 0
+        edges_dead = 0
+        for (ex1, ey1, ex2, ey2, est) in en_edges:
+            if _seg_cross(src, (tx, ty), (ex1, ey1), (ex2, ey2)):
+                edges_hit += 1
+                if est <= atk:
+                    edges_dead += 1
+
+        s += nodes_hit * cfg.node_hit * atk * dyn_atk
+        s += hub_value * cfg.hub_factor * atk * dyn_atk
+        s += edges_dead * cfg.edge_kill * atk * dyn_atk
+        s += (edges_hit - edges_dead) * cfg.edge_hit * dyn_atk
+
+        # 从根节点开新枝且无战果 → 惩罚 (鼓励从已有前线推进)
+        if parent.parent is None and len(parent.children) >= 1:
+            if nodes_hit == 0 and edges_hit == 0 and not collected:
+                s -= 15.0
+        elif parent.parent is not None:
+            s += 4.0
+
+        # 花范围延长却无任何战果 → 重罚
+        if range_index > 0 and nodes_hit == 0 and edges_hit == 0 and not collected:
+            s -= range_index * 10.0 * spend_mult
+
+        # ---- 连击 ----
+        kills = nodes_hit + edges_dead
+        if kills >= 2:
+            s += cfg.decisive2 * dyn_atk
+        elif kills >= 1 and edges_hit >= 1:
+            s += cfg.combo * dyn_atk
+
+        if nodes_hit > 0 or edges_hit > 0:
+            s += (str_ - MIN_STRENGTH) * cfg.str_bonus * dyn_atk
+
+        if kills >= 1 or hit_root:
+            s += cost * spend_mult * 0.4
+
+        # ---- 朝敌根推进 ----
+        d_to = _dist(tx, ty, en_root.x, en_root.y)
+        d_from = _dist(src[0], src[1], en_root.x, en_root.y)
+        s += (d_from - d_to) * cfg.advance * dyn_atk
+        if collected and d_to > d_from:
+            s += (d_to - d_from) * cfg.advance * 0.6
+
+        # ---- 链式推进奖励 (回放学习: 人类 58% 落子沿"父→敌根"直线延伸) ----
+        v1x = en_root.x - src[0]
+        v1y = en_root.y - src[1]
+        v2x = tx - src[0]
+        v2y = ty - src[1]
+        l1 = math.hypot(v1x, v1y)
+        l2 = math.hypot(v2x, v2y)
+        if l1 > 1.0 and l2 > 1.0:
+            cosang = (v1x * v2x + v1y * v2y) / (l1 * l2)
+            s += cosang * cfg.chain_bonus * dyn_atk
+
+        # ---- 中心控制 ----
+        d_c = _dist(tx, ty, CENTER_X, CENTER_Y)
+        if d_c < 300:
+            s += (300 - d_c) * cfg.center
+
+        # ---- 压制敌方可扩展节点 ----
+        pinned = 0
+        for n in en_nodes:
+            if len(n.children) < MAX_CHILDREN:
+                d = _dist(tx, ty, n.x, n.y)
+                if 20 < d < 55:
+                    pinned += 1
+        s += pinned * 8.0 * dyn_atk
+
+        # ---- 开拓版图 ----
+        min_own = 1e9
+        for n in self.game.nodes:
+            if n.team != self.team or n is parent:
+                continue
+            d = _dist(tx, ty, n.x, n.y)
+            if d < min_own:
+                min_own = d
+        if min_own > 70:
+            s += (min_own - 70) * cfg.expand * dyn_exp
+
+        # ---- 从逼近敌根的节点延伸 ----
+        if _dist(src[0], src[1], en_root.x, en_root.y) < 250:
+            s += (250 - _dist(src[0], src[1], en_root.x, en_root.y)) * 0.08 * dyn_atk
+
+        # ---- 防守纵深 ----
+        d_my = _dist(tx, ty, my_root.x, my_root.y)
+        if d_my > 120:
+            s += d_my * cfg.defense * dyn_dfn
+        if sit.flank_threat and d_my < 150:
+            s += 15.0 * dyn_dfn
+        # 深入敌腹地且防线暴露 → 重罚
+        if d_to < 200 and (sit.my_weak_edges >= 2 or sit.my_front_exposed >= 3):
+            s -= (200 - d_to) * 0.12 * dyn_dfn
+
+        # ---- 母节点风险 ----
+        parent_risk = 0.0
+        if parent.parent is not None:
+            if parent.strength <= 1:
+                parent_risk += 24.0
+            elif parent.strength == 2:
+                parent_risk += 8.0
+            d_pe = _dist(parent.x, parent.y, en_root.x, en_root.y)
+            if d_pe < 260:
+                parent_risk += (260 - d_pe) * 0.08
+            pval = self.subtree_size(parent)
+            if pval >= 3:
+                parent_risk += (pval - 2) * 4.0
+        s -= parent_risk * dyn_dfn
+
+        # ---- 记忆: 已确认被摧毁的落点不重建 (打地鼠惩罚, 权重需足够大) ----
+        for kx, ky in self.mem.get('killed_targets', []):
+            d = _dist(tx, ty, kx, ky)
+            if d < 80:
+                s -= (80 - d) * 10.0
+
+        # ---- 僵持放大 ----
+        if self.mem.get('stall_turns', 0) >= 3:
+            s *= 1.25
+            if nodes_hit > 0:
+                s *= 1.4
+
+        # ---- 成本 ----
+        s -= cost * spend_mult
+        s += (str_ - MIN_STRENGTH) * 2.5
+        s += self._rng.uniform(-2.0, 2.0)
+        return s
+
+    # ============================================================
+    # 威胁惩罚
+    # ============================================================
+    def threat_penalty(self, parent, tgt, en_expandable, en_nodes):
+        cfg = self.cfg
+        risk = cfg.risk_taker
+        my_root, en_root = self.my_root, self.en_root
+        tx, ty = tgt
+        pen = 0.0
+
+        # 贴近敌根且非杀根的落点 → 建了也会被拆
+        d_en = _dist(tx, ty, en_root.x, en_root.y)
+        if d_en < 90:
+            pen += (90 - d_en) * 2.2
+        if d_en < 45:
+            pen += (45 - d_en) * 3.0
+
+        # 敌方可扩展节点能延伸打击此落点
+        for e in en_expandable:
+            d = _dist(e.x, e.y, tx, ty)
+            if d < 20 or d > MAX_RANGE:
+                continue
+            ri = _range_index(d)
+            if ri is None or ri > 2:
+                continue
+            blocked = False
+            for o in self.game.nodes:
+                if o.team == self.team and o is not parent:
+                    if _pt_seg_dist(o.x, o.y, e.x, e.y, tx, ty) < _OCCUPY_BLOCK:
+                        blocked = True
+                        break
+            if not blocked:
+                pen += 14.0 * cfg.threat_mul
+
+        # 敌方节点本身的距离惩罚
+        for e in en_nodes:
+            d = _dist(e.x, e.y, tx, ty)
+            if d < 35:
+                pen += (35 - d) * 0.5 * cfg.threat_mul
+            if d < 55 and len(e.children) < MAX_CHILDREN:
+                pen += (55 - d) * 0.2 * cfg.threat_mul
+
+        # 敌方从母节点方向延伸会切断我这条新枝
+        for e in en_expandable:
+            d = _dist(e.x, e.y, parent.x, parent.y)
+            if d < 20 or d > MAX_RANGE:
+                continue
+            mid = ((parent.x + tx) * 0.5, (parent.y + ty) * 0.5)
+            dx, dy = mid[0] - e.x, mid[1] - e.y
+            L = math.hypot(dx, dy)
+            if L < 1:
+                continue
+            ux, uy = dx / L, dy / L
+            for dist in (60, 90, 120, 150, 180, 210, 240):
+                ex = e.x + ux * dist
+                ey = e.y + uy * dist
+                if _seg_cross((e.x, e.y), (ex, ey), (parent.x, parent.y), (tx, ty)):
+                    pen += 10.0 * cfg.threat_mul
+                    break
+
+        # 离我根过远
+        d_root = _dist(tx, ty, my_root.x, my_root.y)
+        if d_root > 450:
+            pen += (d_root - 450) * 0.1
+        # 僵持无进展 → 降低威胁惩罚, 鼓励冒险破局
+        if self.mem.get('no_progress', 0) >= 3:
+            pen *= 0.5
+        return pen
+
+    # ============================================================
+    # 薄弱边强化
+    # ============================================================
+    def choose_reinforce(self, nodes, my_score, en_score):
+        """返回值得加固的己方边 (子节点), 否则 None。"""
+        if self.my_root is None or self.en_root is None:
+            self._find_roots()
+        if self.sit is None:
+            self.sit = self.analyze_situation()
+        cands = []
+        for n in nodes:
+            if n.team != self.team:
+                continue
+            for c in n.children:
+                if c.strength >= 4:
+                    continue
+                min_d = 1e9
+                for en in nodes:
+                    if en.team == self.team:
+                        continue
+                    d = _pt_seg_dist(en.x, en.y, n.x, n.y, c.x, c.y)
+                    if d < min_d:
+                        min_d = d
+                rng = 260.0 if c.strength <= 1 else 200.0
+                if min_d < rng:
+                    val = self.subtree_size(c)
+                    up_factor = 1.0
+                    if c.parent is not None and c.parent.parent is not None and \
+                            c.parent.strength <= c.strength:
+                        up_factor = 0.4
+                    threat = (rng - min_d) * (5 - c.strength) * (0.2 + val * 0.6) * up_factor
+                    cands.append((threat, c))
+        if not cands:
+            return None
+        cands.sort(key=lambda t: -t[0])
+
+        reserve = self.compute_reserve(my_score, len(nodes))
+        budget = max(0, my_score - reserve - 1)
+        if en_score >= 8:
+            budget = max(budget, max(0, my_score - reserve))
+        if en_score >= 12:
+            budget = max(budget, max(0, my_score - reserve + 1))
+        if cands[0][0] > 40:
+            budget = max(budget, 1)
+        if cands[0][0] > 90:
+            budget = max(budget, 2)
+        budget = min(budget, max(0, my_score))
+        if budget <= 0:
+            return None
+        threat, c = cands[0]
+        if c.strength >= MAX_STRENGTH:
+            return None
+        return c
+
+    # ============================================================
+    # 轻量前向模拟 (移植自 C++ simulateLookahead)
+    # ============================================================
+    def _sim_best_move(self, sim, team):
+        """在模拟局面中贪心求某方最佳移动 (用简化静态分)。"""
+        best = None
+        best_s = -1e18
+        my_r = sim.my_root if team == self.team else sim.en_root
+        en_r = sim.en_root if team == self.team else sim.my_root
+        if my_r is None or en_r is None:
+            return None
+        expand = [sn for sn in sim.all if sn.team == team and len(sn.children) < MAX_CHILDREN]
+        expand.sort(key=lambda sn: _dist(sn.x, sn.y, en_r.x, en_r.y))
+        for sn in expand[:6]:
+            dx = en_r.x - sn.x
+            dy = en_r.y - sn.y
+            L = math.hypot(dx, dy)
+            targets = []
+            if L > 1:
+                ux, uy = dx / L, dy / L
+                for dist in (45, 75, 105, 140, 175, 210):
+                    targets.append((sn.x + ux * dist, sn.y + uy * dist))
+                for ang in (-0.5, 0.5):
+                    cs, sn2 = math.cos(ang), math.sin(ang)
+                    rx = ux * cs - uy * sn2
+                    ry = ux * sn2 + uy * cs
+                    for dist in (60, 100, 150):
+                        targets.append((sn.x + rx * dist, sn.y + ry * dist))
+            # 敌方节点/敌根周边
+            for on in sim.all:
+                if on.team != team:
+                    d = _dist(on.x, on.y, sn.x, sn.y)
+                    if 25 < d < MAX_RANGE:
+                        targets.append((on.x, on.y))
+                        break
+            for t in targets:
+                if not self._in_bounds(t[0], t[1]):
+                    continue
+                d = _dist(sn.x, sn.y, t[0], t[1])
+                ri = _range_index(d)
+                if ri is None:
+                    continue
+                for str_ in (MIN_STRENGTH, 2, 3):
+                    cost = ri + (str_ - MIN_STRENGTH)
+                    if cost > 8:       # 模拟中给一个宽松预算
+                        continue
+                    sc = self._sim_quick_score(sn, t, str_, ri, sim, team)
+                    if sc > best_s:
+                        best_s = sc
+                        best = (sn, t, str_, ri)
+        return best
+
+    def _sim_quick_score(self, parent, tgt, str_, ri, sim, team):
+        s = 0.5
+        src = (parent.x, parent.y)
+        tx, ty = tgt
+        enemy = self.enemy_team if team == self.team else self.team
+        en_root = sim.en_root if team == self.team else sim.my_root
+        # 命中节点
+        nodes_hit = 0
+        hub = 0
+        for sn in sim.all:
+            if sn.team != enemy:
+                continue
+            if (sn.x == src[0] and sn.y == src[1]) or (sn.x == tx and sn.y == ty):
+                continue
+            if _seg_hits_circle(src[0], src[1], tx, ty, sn.x, sn.y, NODE_RADIUS):
+                if sn.parent is None:
+                    return 10000.0
+                nodes_hit += 1
+                hub += sn.subtree()
+        # 命中边
+        edges_hit = 0
+        edges_dead = 0
+        for sn in sim.all:
+            if sn.team == enemy and sn.parent is not None:
+                if _seg_cross(src, (tx, ty), (sn.parent.x, sn.parent.y), (sn.x, sn.y)):
+                    edges_hit += 1
+                    if sn.strength <= str_:
+                        edges_dead += 1
+        atk = str_
+        s += nodes_hit * self.cfg.node_hit * atk + hub * self.cfg.hub_factor * atk
+        s += edges_dead * self.cfg.edge_kill * atk + (edges_hit - edges_dead) * self.cfg.edge_hit
+        # 推进
+        d_to = _dist(tx, ty, en_root.x, en_root.y)
+        d_from = _dist(src[0], src[1], en_root.x, en_root.y)
+        s += (d_from - d_to) * self.cfg.advance
+        # 收集 (近似: 落点碰包)
+        for sp in self.game.pickups:
+            if _dist(tx, ty, sp.x, sp.y) < PICKUP_COLLECT_DIST:
+                s += sp.value * self.cfg.collect + sp.value * 5.0
+        s -= (ri + (str_ - MIN_STRENGTH)) * 2.0
+        return s
+
+    def _sim_eval(self, sim):
+        my_n = en_n = 0
+        my_e = en_e = 0.0
+        min_d = 1e9
+        for sn in sim.all:
+            if sn.team == self.team:
+                my_n += 1
+                for c in sn.children:
+                    my_e += c.strength
+                if sim.en_root:
+                    d = _dist(sn.x, sn.y, sim.en_root.x, sim.en_root.y)
+                    if d < min_d:
+                        min_d = d
+            else:
+                en_n += 1
+                for c in sn.children:
+                    en_e += c.strength
+        e = (my_n - en_n) * 18.0 + (my_e - en_e) * 1.2
+        if min_d < 1e8:
+            e -= min_d * 0.08
+        return e
+
+    def simulate_lookahead(self, parent, tgt, str_, ri, nodes, pickups):
+        """对 top 候选做贪心 2 轮推演, 返回局面增益 delta。"""
+        try:
+            sim = _SimState(nodes, self.team, self.enemy_team)
+            cl = sim.map.get(parent)
+            if cl is None or sim.my_root is None or sim.en_root is None:
+                return 0.0
+            if not sim.apply(cl, tgt, str_, self.team):
+                return 0.0
+            if sim.en_root is None:
+                return 1e9
+            if sim.my_root is None:
+                return -1e9
+            base = self._sim_eval(sim)
+            # 2 轮: 敌回应 → 我回应
+            for _ in range(2):
+                if sim.my_root is None or sim.en_root is None:
+                    break
+                em = self._sim_best_move(sim, self.enemy_team)
+                if em:
+                    e_parent, e_tgt, e_str, e_ri = em
+                    if not sim.apply(e_parent, e_tgt, e_str, self.enemy_team):
+                        pass
+                if sim.my_root is None or sim.en_root is None:
+                    break
+                mm = self._sim_best_move(sim, self.team)
+                if mm:
+                    m_parent, m_tgt, m_str, m_ri = mm
+                    if not sim.apply(m_parent, m_tgt, m_str, self.team):
+                        pass
+            if sim.en_root is None:
+                return 1e9
+            if sim.my_root is None:
+                return -1e9
+            return self._sim_eval(sim) - base
+        except Exception:
+            return 0.0
+
+    # ============================================================
+    # 最优落子
+    # ============================================================
+    def best_placement(self, nodes, my_score, en_score, pickups):
+        team = self.team
+        en_root = self.en_root
+        sit = self.sit
+
+        en_nodes = [n for n in nodes if n.team != team]
+        en_edges = []
+        for n in nodes:
+            if n.team != team and n.parent is not None:
+                en_edges.append((n.parent.x, n.parent.y, n.x, n.y, n.strength))
+        en_expandable = [n for n in en_nodes if len(n.children) < MAX_CHILDREN]
+
+        expandables = [n for n in nodes if n.team == team and len(n.children) < MAX_CHILDREN]
+        if not expandables:
+            return None
+        expandables.sort(key=lambda n: _dist(n.x, n.y, en_root.x, en_root.y))
+        if len(expandables) > 8:
+            expandables = expandables[:8]
+
+        spend_mult = self._spend_multiplier(my_score, len(nodes))
+        reserve = self.compute_reserve(my_score, len(nodes))
+        spendable = max(0, my_score - reserve)
+        dyn = self._dynamic_multipliers()
+
+        all_cands = []
+        for n in expandables:
+            targets = self.gen_targets(n, nodes, en_root, pickups)
+            for t in targets:
+                if not self._valid_target(n, t, nodes):
+                    continue
+                d = _dist(n.x, n.y, t[0], t[1])
+                ri = _range_index(d)
+                if ri is None:
+                    continue
+                max_str = min(MAX_STRENGTH, spendable - ri + MIN_STRENGTH)
+                for str_ in range(MIN_STRENGTH, max_str + 1):
+                    cost = ri + (str_ - MIN_STRENGTH)
+                    if cost > spendable:
+                        break
+                    sc = self.score_target(n, t, str_, ri, spend_mult, dyn,
+                                           en_nodes, en_edges, pickups)
+                    all_cands.append((sc, n, t, str_, ri))
+                    if len(all_cands) >= 1600:
+                        break
+                if len(all_cands) >= 1600:
+                    break
+            if len(all_cands) >= 1600:
+                break
+
+        if not all_cands:
+            return None
+
+        # 威胁惩罚 (只对 top 候选做, 节省性能)
+        all_cands.sort(key=lambda c: -c[0])
+        top_n = min(len(all_cands), 25)
+        for i in range(top_n):
+            sc, n, t, str_, ri = all_cands[i]
+            pen = self.threat_penalty(n, t, en_expandable, en_nodes)
+            all_cands[i] = (sc - pen, n, t, str_, ri)
+        all_cands.sort(key=lambda c: -c[0])
+
+        # 轻量前向模拟 (只对 top 3)
+        if len(nodes) <= 60:
+            top_k = min(len(all_cands), 3)
+            for i in range(top_k):
+                sc, n, t, str_, ri = all_cands[i]
+                delta = self.simulate_lookahead(n, t, str_, ri, nodes, pickups)
+                if delta > 0:
+                    all_cands[i] = (sc * 0.4 + delta * 0.6, n, t, str_, ri)
+            all_cands.sort(key=lambda c: -c[0])
+
+        best = all_cands[0]
+        self.mem['last_target'] = (best[2][0], best[2][1])
+        self.mem['last_placed'] = (best[2][0], best[2][1])
+        self.mem['last_placed_en'] = self.sit.en_nodes
+        self.mem['stall_turns'] = 0
+        return {'type': 'place_node', 'parent': best[1],
+                'x': best[2][0], 'y': best[2][1],
+                'strength': best[3], 'range_index': best[4]}
+
+    def _desperate_placement(self, nodes, my_score):
+        """绝望模式: 常规落子无解时 (点数耗尽/目标全被占), 放宽间距强制放置,
+        并优先贴近点数包以便收集回血, 避免无限僵持。"""
+        team = self.team
+        en_root = self.en_root
+        pickups = self.game.pickups
+        expandables = [n for n in nodes if n.team == team and len(n.children) < MAX_CHILDREN]
+        if not expandables:
+            return None
+        best = None
+        best_score = -1e18
+        for n in expandables:
+            targets = self.gen_targets(n, nodes, en_root, pickups, light=True)
+            for t in targets:
+                tx, ty = t
+                if not self._in_bounds(tx, ty):
+                    continue
+                d = _dist(n.x, n.y, tx, ty)
+                if d < 20 or d > MAX_RANGE:
+                    continue
+                ri = _range_index(d)
+                if ri is None:
+                    continue
+                if ri > my_score:          # 绝望时也尽量不超预算
+                    continue
+                # 宽松间距: 允许最小 20px (节点半径 18, 几乎相切)
+                ok = True
+                for o in nodes:
+                    if o is n:
+                        continue
+                    if (o.x - tx) ** 2 + (o.y - ty) ** 2 < 20 * 20:
+                        ok = False
+                        break
+                if not ok:
+                    continue
+                # 优先能捡到点数包的落点
+                score = -d * 0.05
+                for sp in pickups:
+                    pd = _dist(tx, ty, sp.x, sp.y)
+                    if pd < PICKUP_COLLECT_DIST:
+                        score += 200.0 + sp.value * 60.0
+                    elif pd < 130:
+                        score += sp.value * 2.0 * (1.0 - pd / 130.0)
+                if score > best_score:
+                    best_score = score
+                    best = {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
+                            'strength': MIN_STRENGTH, 'range_index': ri}
+        if best is not None:
+            self.mem['last_placed_en'] = self.sit.en_nodes
+        return best
+
+    def _emergency_collect(self, nodes, my_score):
+        """低点数应急: 找一处免费落子 (强度1, 范围120) 直接碰到点数包, 恢复资源。
+        防止"点数耗尽 → 杀根窗口付不起费"的死亡螺旋 (回放 20260810_154845 的失败根因)。
+        """
+        if my_score >= 5:
+            return None
+        team = self.team
+        en_root = self.en_root
+        if en_root is None:
+            return None
+        pickups = self.game.pickups
+        expandables = [n for n in nodes if n.team == team and len(n.children) < MAX_CHILDREN]
+        best = None
+        best_score = -1e18
+        for n in expandables:
+            for sp in pickups:
+                # 免费范围120内能否落到包上
+                tx, ty = sp.x, sp.y
+                d = _dist(n.x, n.y, tx, ty)
+                if d < MIN_SPACING or d > RANGE_OPTIONS[0]:
+                    continue
+                if not self._in_bounds(tx, ty):
+                    continue
+                if self._occupied(tx, ty, nodes, n):
+                    continue
+                # 朝敌根方向加分 (避免为捡包大幅绕路)
+                v1x = en_root.x - n.x
+                v1y = en_root.y - n.y
+                l1 = math.hypot(v1x, v1y)
+                score = sp.value * 100.0
+                if l1 > 1:
+                    score += (v1x * (tx - n.x) + v1y * (ty - n.y)) / l1 * 0.3
+                if score > best_score:
+                    best_score = score
+                    best = {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
+                            'strength': MIN_STRENGTH, 'range_index': 0}
+        return best
+
+    # ============================================================
+    # 决策入口 (与 main.py 的 _ai_update 对接)
+    # ============================================================
+    def decide_action(self):
+        game = self.game
+        if getattr(game, 'state', None) != 'playing':
+            return None
+        if game.current_team != self.team:
+            return None
+        # 本回合已放置过节点 → 只能结束回合 (与 main._ai_update 的守卫一致)
+        if game.has_created_this_turn:
+            return {'type': 'end_turn'}
+
+        self._find_roots()
+        if self.my_root is None or self.en_root is None:
+            return None
+
+        # 检查上次落点是否被摧毁 (打地鼠记忆) — 必须在回合重置前, 否则 last_placed 会被清掉
+        self._update_memory(game.nodes)
+
+        # 回合级记忆重置 (last_placed 已由 _update_memory 消费; 不重置 last_placed_en/no_progress)
+        key = (game.turn_count, game.current_team)
+        if self.mem.get('turn_key') != key:
+            for k in ('reinforce_done', 'last_target', 'stall_turns'):
+                self.mem.pop(k, None)
+            self.mem['turn_key'] = key
+
+        # 分析局面 (每回合重新计算)
+        self.sit = self.analyze_situation()
+        nodes = game.nodes
+        my_score = game.points[self.team]
+        en_score = game.points[self.enemy_team]
+        pickups = game.pickups
+
+        # 进度追踪: 上次落子后敌方节点数未减少 → 无进展计数+1
+        last_en = self.mem.get('last_placed_en')
+        if last_en is not None:
+            if self.sit.en_nodes >= last_en:
+                self.mem['no_progress'] = self.mem.get('no_progress', 0) + 1
+            else:
+                self.mem['no_progress'] = 0
+
+        if not game.has_created_this_turn:
+            # 1) 强制杀根 (一击制胜, 可花光所有点数)
+            kill = self.find_kill_move(nodes, my_score)
+            if kill:
+                return kill
+            # 1.5) 低点数应急拾取: 防止"点数耗尽→杀根窗口付不起费"的死亡螺旋
+            if my_score < 5:
+                collect_move = self._emergency_collect(nodes, my_score)
+                if collect_move:
+                    return collect_move
+            # 2) 薄弱边强化 (每回合最多 2 次, 防止无限加固拖延)
+            if self.mem.get('reinforce_done', 0) < 2:
+                edge = self.choose_reinforce(nodes, my_score, en_score)
+                if edge is not None:
+                    self.mem['reinforce_done'] = self.mem.get('reinforce_done', 0) + 1
+                    return {'type': 'modify_branch', 'node': edge,
+                            'new_strength': min(edge.strength + 1, MAX_STRENGTH)}
+
+        # 3) 常规落子
+        move = self.best_placement(nodes, my_score, en_score, pickups)
+        if move is None:
+            # 绝望模式: 放宽间距强制放置 (避免无限僵持)
+            move = self._desperate_placement(nodes, my_score)
+        if move is None:
+            self.mem['stall_turns'] = self.mem.get('stall_turns', 0) + 1
+            return {'type': 'end_turn'}
+        self.mem['stall_turns'] = 0
+        return move

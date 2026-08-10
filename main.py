@@ -7,6 +7,8 @@ import shutil
 import random
 import logging
 
+from AI.aithink3 import AIThinker
+
 logging.basicConfig(level=logging.DEBUG, format="[%(levelname)s] %(message)s")
 log:logging.Logger = logging.getLogger("BTB")
 
@@ -57,6 +59,8 @@ def _load_all_sfx():
     for f in TAP_SOUNDS.values():
         _load_one(f)
     for f in SHEAR_SOUNDS:
+        _load_one(f)
+    for f in IDLE_SOUNDS:
         _load_one(f)
     for files in ORB_SOUNDS.values():
         for f in files:
@@ -396,6 +400,8 @@ class Game:
         self._AI_THINK_DELAY = 90  # ~1.5 秒思考时间
         self._ai_debug_candidates = []  # AI 候选可视化数据
         self._ai_memory = {}          # AI 跨回合记忆
+        self._ai_post_reinforce = 0   # 本回合放置后已强化的次数
+        self._idle_played_key = None  # 已播放过 idle 的回合标识
         self._resume_from_replay = False
 
         # 回放记录器
@@ -419,6 +425,8 @@ class Game:
         self.has_created_this_turn = False
         self.hovered_branch_child = None
         self._ai_memory = {}  # 每局重置 AI 记忆
+        self._ai_post_reinforce = 0
+        self._idle_played_key = None
         # 创建根节点：红左上，蓝右下
         red_root = Node('RED', 120, 120, strength=1)
         blue_root = Node('BLUE', SCREEN_WIDTH - 120, SCREEN_HEIGHT - 120, strength=1)
@@ -719,6 +727,16 @@ class Game:
         if self.network_mode == 'client' and self.net_client and not self.net_client.connected:
             self.go_menu()
             return
+
+        # 己方回合开始时播放 idle 音效
+        is_my = (self.network_mode is None or self.current_team == self.my_team)
+        if self._ai_mode and self.current_team == self._ai_team:
+            is_my = False
+        if is_my:
+            key = (self.current_team, self.turn_count)
+            if self._idle_played_key != key:
+                self._idle_played_key = key
+                play_sfx('turn')
 
         # 客户端不执行碰撞检测和交叉结算（由服务器处理）
         for pack in self.pickups:
@@ -1965,12 +1983,30 @@ class Game:
 
         self._ai_think_timer = 0
 
-        # 本回合已创建过节点 → 直接结束回合
+        # 本回合已创建过节点 → 先尝试"放置后强化"，再结束回合
         if self.has_created_this_turn:
+            if self._ai_post_reinforce < 2:
+                try:
+                    ai = AIThinker(self)
+                    edge = ai.choose_reinforce(
+                        self.nodes, self.points[self.current_team],
+                        self.points['RED' if self.current_team == 'BLUE' else 'BLUE'])
+                    if (edge is not None and edge.strength < MAX_STRENGTH
+                            and self.points[self.current_team] >= 1):
+                        self._ai_post_reinforce += 1
+                        old_str = edge.strength
+                        edge.strength = old_str + 1
+                        self.points[self.current_team] -= 1
+                        self.replay.record('modify_branch', team=self.current_team,
+                                           node_id=edge.id, old_strength=old_str,
+                                           new_strength=edge.strength)
+                        play_sfx('tap', strength=edge.strength)
+                        return
+                except Exception:
+                    pass
             self._end_turn()
             return
 
-        from AI.aithink import AIThinker
         ai = AIThinker(self)
         action = ai.decide_action()
 
@@ -2087,6 +2123,7 @@ class Game:
         self.dragging = False
         self.drag_node = None
         self.hovered_branch_child = None
+        self._ai_post_reinforce = 0    # 新回合重置
         self._ai_debug_candidates = []  # 清除 AI 候选可视化
 
         # 回放：记录结束回合
