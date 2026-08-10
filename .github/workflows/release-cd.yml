@@ -53,6 +53,7 @@ jobs:
           tar -czf "project-${VERSION}.tar.gz" \
             --exclude=.git \
             --exclude=.github \
+            --warning=no-file-changed \
             .
 
       # 5. 创建 Release 并上传压缩包（完全自定义）
