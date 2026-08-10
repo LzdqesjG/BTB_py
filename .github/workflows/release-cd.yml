@@ -1,0 +1,17 @@
+name: Create Release ZIP
+
+on:
+  push:
+    tags:          # 推送v*标签时触发
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create recursive source ZIP
+        uses: espressif/release-zips-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
