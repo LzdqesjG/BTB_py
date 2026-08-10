@@ -395,6 +395,7 @@ class Game:
         self._ai_think_timer = 0
         self._AI_THINK_DELAY = 90  # ~1.5 秒思考时间
         self._ai_debug_candidates = []  # AI 候选可视化数据
+        self._ai_memory = {}          # AI 跨回合记忆
         self._resume_from_replay = False
 
         # 回放记录器
@@ -417,6 +418,7 @@ class Game:
         self.temp_range_index = 0
         self.has_created_this_turn = False
         self.hovered_branch_child = None
+        self._ai_memory = {}  # 每局重置 AI 记忆
         # 创建根节点：红左上，蓝右下
         red_root = Node('RED', 120, 120, strength=1)
         blue_root = Node('BLUE', SCREEN_WIDTH - 120, SCREEN_HEIGHT - 120, strength=1)
@@ -1136,6 +1138,15 @@ class Game:
         surface.blit(font_mid.render("设置", True, WHITE),
                      font_mid.render("设置", True, WHITE).get_rect(center=self._btn_settings.center))
 
+        # 退出
+        bx_exit = SCREEN_WIDTH // 2 + 8 + btn2_w + 8
+        self._btn_exit = pygame.Rect(bx_exit, btn2_y, btn2_w, btn_h)
+        he = self._btn_exit.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, (180, 60, 60) if he else (120, 40, 40), self._btn_exit, border_radius=8)
+        pygame.draw.rect(surface, WHITE, self._btn_exit, 2, border_radius=8)
+        surface.blit(font_mid.render("退出", True, WHITE),
+                     font_mid.render("退出", True, WHITE).get_rect(center=self._btn_exit.center))
+
         # 右下角版本号与作者
         ver_text = font_tiny.render(f"Binary Tree Battle {VERSION}  by {AUTHOR}", True, (80, 80, 100))
         surface.blit(ver_text, (SCREEN_WIDTH - ver_text.get_width() - 12, SCREEN_HEIGHT - 22))
@@ -1520,6 +1531,10 @@ class Game:
             elif hasattr(self, '_btn_settings') and self._btn_settings.collidepoint(event.pos):
                 play_sfx('click')
                 # 设置：预留
+            elif hasattr(self, '_btn_exit') and self._btn_exit.collidepoint(event.pos):
+                play_sfx('click')
+                pygame.quit()
+                sys.exit()
 
     def _enter_replay_select(self):
         """进入回放文件选择界面。解析每个回放的步数和胜者。"""
@@ -2043,10 +2058,12 @@ class Game:
         elif action['type'] == 'modify_branch':
             node = action['node']
             new_str = action['new_strength']
-            if node.strength < MAX_STRENGTH and self.points[self.current_team] >= 1:
+            new_str = max(MIN_STRENGTH, min(MAX_STRENGTH, int(new_str)))
+            diff = new_str - node.strength
+            if diff > 0 and self.points[self.current_team] >= diff:
                 old_str = node.strength
                 node.strength = new_str
-                self.points[self.current_team] -= 1
+                self.points[self.current_team] -= diff
                 self.replay.record('modify_branch', team=self.current_team,
                                    node_id=node.id, old_strength=old_str,
                                    new_strength=new_str)

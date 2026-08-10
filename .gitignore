@@ -19,3 +19,6 @@ tests/
 replays/*
 replays/deleted/*
 *.bpr
+
+# backup files
+*.bak
