@@ -415,10 +415,15 @@ class Game:
         self._idle_played_key = None  # 已播放过 idle 的回合标识
         self._resume_from_replay = False
         self._ai_learned = False      # 本局 AI 是否已完成学习记录（只记一次）
-        # AI 选点动态可视化
+        # AI 选点动态可视化 / 迭代规划
         self._ai_pending_action = None   # 已决策待执行的 AI 动作（先播动画）
         self._ai_anim_timer = 0          # 动画计时
-        self._AI_ANIM_FRAMES = 40        # 候选动画帧数 (~0.67s)
+        self._AI_ANIM_FRAMES = 40        # 决策后候选动画帧数 (~0.67s)
+        self._ai_planner = None          # 迭代规划器实例（思考期间）
+        self._ai_think_target = 0        # 当前思考目标帧数（基础 2s / 上限 5s）
+        # 思考时长：基础 2 秒（兼容设置里调大的值），复杂局面 AI 可延长至上限 5 秒
+        self._AI_THINK_BASE_FRAMES = max(self._AI_THINK_DELAY, int(self.fps * 2.0))
+        self._AI_THINK_MAX_FRAMES = int(self.fps * 5.0)
 
         # 回放记录器
         self.replay = ReplayRecorder()
@@ -1776,7 +1781,8 @@ class Game:
         # 底部提示
         if self._ai_mode and (self.current_team == self._ai_team
                               or (self._ai_custody and self.current_team == self.my_team)):
-            pct = int(self._ai_think_timer / self._AI_THINK_DELAY * 100)
+            target = self._ai_think_target if self._ai_think_target > 0 else self._AI_THINK_BASE_FRAMES
+            pct = int(self._ai_think_timer / max(1, target) * 100)
             progress_label = f"AI 思考中... ({pct}%)" if self._ai_think_timer > 0 else "AI 思考中..."
             hint = font_tiny.render(progress_label, True, (200, 160, 60))
         elif self.network_mode and self.current_team != self.my_team:
@@ -2530,8 +2536,8 @@ class Game:
     def _ai_update(self):
         """AI 回合自动操作。每帧调用。
 
-        决策后先播放选点动画（候选点渐显、最优解高亮），
-        动画结束再真正执行动作。
+        采用迭代规划：AI 在 2~5 秒思考窗口内逐步加深前向模拟，
+        选点动画实时反映候选分数重排；思考结束后执行最优动作。
         """
         # 有待执行的动作：播放选点动画
         if self._ai_pending_action is not None:
@@ -2542,12 +2548,6 @@ class Game:
                 self._ai_anim_timer = 0
                 self._execute_ai_action(action)
             return
-
-        if self._ai_think_timer < self._AI_THINK_DELAY:
-            self._ai_think_timer += 1
-            return
-
-        self._ai_think_timer = 0
 
         # 本回合已创建过节点 → 先尝试"放置后强化"，再结束回合
         if self.has_created_this_turn:
@@ -2575,20 +2575,48 @@ class Game:
             self._end_turn()
             return
 
+        # 迭代规划进行中：推进精化，30fps 节拍更新可视化
+        if self._ai_planner is not None:
+            self._ai_think_timer += 1
+            if self._ai_think_timer % 2 == 0:   # 60fps 下每 2 帧 = 30fps
+                try:
+                    finished, viz = self._ai_planner.plan_step()
+                    self._ai_debug_candidates = viz
+                except Exception:
+                    pass
+            # 到达目标思考时长 → 结束规划，取最终动作
+            if self._ai_think_timer >= self._ai_think_target:
+                action = self._ai_planner.finish_plan()
+                self._ai_planner = None
+                self._ai_think_timer = 0
+                self._ai_think_target = 0
+                if action is None:
+                    self._end_turn()
+                    return
+                self._ai_pending_action = action
+                self._ai_anim_timer = 0
+            return
+
+        # 开始新一轮迭代规划
+        self._ai_think_timer = 0
         ai = AIThinker(self)
         ai.team = self.current_team  # 托管时按当前回合队伍，不锁定 _ai_team
         ai.enemy_team = 'BLUE' if ai.team == 'RED' else 'RED'
-        action = ai.decide_action()
-
-        if action is None:
+        immediate, need_more, viz = ai.begin_planning(
+            self.nodes, self.points[self.current_team],
+            self.points['RED' if self.current_team == 'BLUE' else 'BLUE'],
+            self.pickups)
+        if immediate is not None:
+            # 快速动作（杀根/捡包/强化/结束）：短暂动画后执行
+            self._ai_debug_candidates = viz
+            self._ai_pending_action = immediate
+            self._ai_anim_timer = 0
             return
-
-        # 收集候选可视化数据（parent, x, y, strength, range_index, score）
-        self._ai_debug_candidates = list(getattr(ai, 'last_cands', []))
-
-        # 暂存动作，先播放选点动画
-        self._ai_pending_action = action
-        self._ai_anim_timer = 0
+        # 常规落子：进入迭代规划
+        self._ai_planner = ai
+        self._ai_debug_candidates = viz
+        # 思考目标帧数：基础 2 秒；AI 认为需要更久时延长至 5 秒
+        self._ai_think_target = self._AI_THINK_MAX_FRAMES if need_more else self._AI_THINK_BASE_FRAMES
 
     def _execute_ai_action(self, action):
         """执行 AI 决策的动作（选点动画结束后调用）。"""
@@ -2661,8 +2689,31 @@ class Game:
                     self._broadcast_state_changed()
                 play_sfx('tap', strength=new_str)
 
+    def _ai_score_color(self, score, min_s, max_s):
+        """把候选分数映射为优势色：高优势红、低优势绿（中间经黄过渡）。
+
+        返回 (r, g, b)。
+        """
+        if max_s <= min_s:
+            t = 0.5
+        else:
+            t = (score - min_s) / (max_s - min_s)
+        t = max(0.0, min(1.0, t))
+        # 绿(60,200,60) → 黄(240,220,60) → 红(255,60,60)
+        if t < 0.5:
+            f = t * 2
+            r = int(60 + (240 - 60) * f)
+            g = int(200 + (220 - 200) * f)
+            b = 60
+        else:
+            f = (t - 0.5) * 2
+            r = int(240 + (255 - 240) * f)
+            g = int(220 + (60 - 220) * f)
+            b = 60
+        return (r, g, b)
+
     def _draw_ai_candidates(self, surface):
-        """动态绘制 AI 选点候选：评分越高越先亮起，最优解金色脉冲高亮。
+        """动态绘制 AI 选点候选：按优势上色（高优势红、低优势绿），显示 top16。
 
         候选数据格式: [(parent, x, y, strength, range_index, score), ...]
         """
@@ -2670,12 +2721,14 @@ class Game:
         if not cands:
             return
         now = pygame.time.get_ticks()
-        # 动画进度 0~1
+        # 动画进度 0~1（30fps 节拍推进）
         anim_t = min(1.0, self._ai_anim_timer / max(1, self._AI_ANIM_FRAMES))
 
-        # 按评分从高到低排序
-        cands_sorted = sorted(cands, key=lambda c: -c[5])
-        max_score = max(c[5] for c in cands_sorted) or 1.0
+        # 按评分从高到低排序，取前 16
+        cands_sorted = sorted(cands, key=lambda c: -c[5])[:16]
+        scores = [c[5] for c in cands_sorted]
+        min_s = min(scores)
+        max_s = max(scores)
 
         for i, (parent, x, y, strength, ri, score) in enumerate(cands_sorted):
             # 每个候选按其排名在动画中依次亮起
@@ -2684,19 +2737,20 @@ class Game:
             if local_t <= 0:
                 continue
             local_t = min(1.0, local_t)
-            alpha = int(70 + 150 * local_t * (0.4 + 0.6 * (score / max_score)))
+            alpha = int(60 + 170 * local_t)
             alpha = max(30, min(220, alpha))
-            color = TEAM_COLORS[self.current_team]['main']
+            # 优势色：高优势红、低优势绿
+            col = self._ai_score_color(score, min_s, max_s)
 
-            # 候选连线：半透明虚线
+            # 候选连线：半透明虚线（用优势色）
             self._draw_dashed_line(surface, (parent.x, parent.y), (x, y),
-                                   (255, 255, 120, alpha), dash_len=8, gap_len=6, width=1)
+                                   (*col, alpha), dash_len=8, gap_len=6, width=1)
             # 候选节点小圆
             r = int(NODE_RADIUS * 0.5 + strength * 0.5)
-            pygame.draw.circle(surface, (*color[:3], alpha), (int(x), int(y)), r, 1)
-            pygame.draw.circle(surface, (*color[:3], alpha // 3), (int(x), int(y)), r - 1)
+            pygame.draw.circle(surface, (*col, alpha), (int(x), int(y)), r, 1)
+            pygame.draw.circle(surface, (*col, alpha // 3), (int(x), int(y)), r - 1)
             # 评分数字
-            s_txt = font_tiny.render(str(int(score)), True, (255, 255, 180, alpha))
+            s_txt = font_tiny.render(str(int(score)), True, (255, 255, 255, alpha))
             surface.blit(s_txt, s_txt.get_rect(center=(x, y - r - 8)))
 
         # 最优解：金色脉冲光环

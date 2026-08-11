@@ -1611,7 +1611,11 @@ class AIThinker:
     # ============================================================
     # 最优落子
     # ============================================================
-    def best_placement(self, nodes, my_score, en_score, pickups):
+    def _gen_cands(self, nodes, my_score, en_score, pickups, cap=1600):
+        """生成全部候选并做静态评分 + 威胁惩罚，返回排序后的列表。
+
+        返回 [(sc, n, t, str_, ri), ...] 按 sc 降序；无候选返回 None。
+        """
         team = self.team
         en_root = self.en_root
         sit = self.sit
@@ -1656,11 +1660,11 @@ class AIThinker:
                     sc = self.score_target(n, t, str_, ri, spend_mult, dyn,
                                            en_nodes, en_edges, pickups)
                     all_cands.append((sc, n, t, str_, ri))
-                    if len(all_cands) >= 1600:
+                    if len(all_cands) >= cap:
                         break
-                if len(all_cands) >= 1600:
+                if len(all_cands) >= cap:
                     break
-            if len(all_cands) >= 1600:
+            if len(all_cands) >= cap:
                 break
 
         if not all_cands:
@@ -1674,6 +1678,119 @@ class AIThinker:
             pen = self.threat_penalty(n, t, en_expandable, en_nodes)
             all_cands[i] = (sc - pen, n, t, str_, ri)
         all_cands.sort(key=lambda c: -c[0])
+        return all_cands
+
+    def begin_planning(self, nodes, my_score, en_score, pickups):
+        """开始 AI 决策（迭代规划版）。
+
+        返回 (immediate_action, need_more_time, viz_cands)
+        - immediate_action: 若非 None，表示这是快速动作（杀根/捡包/强化/结束），直接执行
+        - need_more_time: 常规落子时，是否建议延长思考到 5 秒上限
+        - viz_cands: 常规落子的初始 top16 候选可视化数据 [(parent, x, y, strength, ri, score)]
+        """
+        game = self.game
+        # 前置准备（与 decide_action 一致）
+        self._find_roots()
+        if self.my_root is None or self.en_root is None:
+            return None, False, []
+        self._update_memory(game.nodes)
+        self.observe_opponent(game.nodes)
+        key = (game.turn_count, game.current_team)
+        if self.mem.get('turn_key') != key:
+            for k in ('reinforce_done', 'last_target', 'stall_turns'):
+                self.mem.pop(k, None)
+            self.mem['turn_key'] = key
+        self.sit = self.analyze_situation()
+        last_en = self.mem.get('last_placed_en')
+        if last_en is not None:
+            if self.sit.en_nodes >= last_en:
+                self.mem['no_progress'] = self.mem.get('no_progress', 0) + 1
+            else:
+                self.mem['no_progress'] = 0
+
+        # 快速分支（无需长思考）
+        if not game.has_created_this_turn:
+            kill = self.find_kill_move(nodes, my_score)
+            if kill:
+                return kill, False, []
+            if my_score < 8:
+                collect_move = self._emergency_collect(nodes, my_score)
+                if collect_move:
+                    return collect_move, False, []
+            if self.mem.get('reinforce_done', 0) < 4:
+                edge = self.choose_reinforce(nodes, my_score, en_score)
+                if edge is not None:
+                    self.mem['reinforce_done'] = self.mem.get('reinforce_done', 0) + 1
+                    return {'type': 'modify_branch', 'node': edge,
+                            'new_strength': min(edge.strength + 1, MAX_STRENGTH)}, False, []
+
+        # 常规落子 → 进入迭代规划
+        self._plan_all = self._gen_cands(nodes, my_score, en_score, pickups)
+        self._plan_nodes = nodes
+        self._plan_pickups = pickups
+        self._plan_done = 0            # 已完成前向模拟的候选数（从 top 开始）
+        self._plan_round = 0
+        self._plan_fallback = None
+        if not self._plan_all:
+            # 常规落子无解 → 绝望模式兜底
+            move = self._desperate_placement(nodes, my_score)
+            self._plan_fallback = move
+            return None, False, []
+        # top 至少精化 16 个候选（模拟后几步对局）
+        self._plan_max_sim = min(len(self._plan_all), 16)
+        need_more = (len(self._plan_all) > 300) or (len(nodes) > 50)
+        return None, need_more, self._plan_viz()
+
+    def _plan_viz(self, k=16):
+        """把候选池转成可视化数据（取前 k 个）。"""
+        out = []
+        for sc, n, t, str_, ri in self._plan_all[:k]:
+            out.append((n, t[0], t[1], str_, ri, sc))
+        return out
+
+    def plan_step(self, sim_per_step=2):
+        """推进一轮迭代规划：对 top 尚未精化的候选做前向模拟并重排。
+
+        所有 top 候选都精化过一轮后自动循环第二轮（继续加深）。
+        返回 (finished, viz_cands)。
+        """
+        if not self._plan_all:
+            return True, self._plan_viz()
+        cands = self._plan_all
+        todo = min(len(cands), self._plan_max_sim)
+        count = 0
+        while count < sim_per_step:
+            i = self._plan_done % todo
+            sc, n, t, str_, ri = cands[i]
+            delta = self.simulate_lookahead(n, t, str_, ri,
+                                            self._plan_nodes, self._plan_pickups)
+            if delta > 0:
+                cands[i] = (sc * 0.4 + delta * 0.6, n, t, str_, ri)
+            self._plan_done += 1
+            count += 1
+        cands.sort(key=lambda c: -c[0])
+        self._plan_round += 1
+        # 时间由 main 控制：循环精化直到思考时长耗尽
+        return False, self._plan_viz()
+
+    def finish_plan(self):
+        """返回最终最优动作（精化后的 top1）。"""
+        if not self._plan_all:
+            return self._plan_fallback
+        best = self._plan_all[0]
+        self.last_cands = self._plan_viz()
+        self.mem['last_target'] = (best[2][0], best[2][1])
+        self._remember_placement(best[2][0], best[2][1])
+        self.mem['last_placed_en'] = self.sit.en_nodes
+        self.mem['stall_turns'] = 0
+        return {'type': 'place_node', 'parent': best[1],
+                'x': best[2][0], 'y': best[2][1],
+                'strength': best[3], 'range_index': best[4]}
+
+    def best_placement(self, nodes, my_score, en_score, pickups):
+        all_cands = self._gen_cands(nodes, my_score, en_score, pickups)
+        if not all_cands:
+            return None
 
         # 轻量前向模拟 (只对 top 3)
         if len(nodes) <= 60:
