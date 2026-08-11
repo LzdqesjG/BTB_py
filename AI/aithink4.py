@@ -1687,6 +1687,11 @@ class AIThinker:
             for t in targets:
                 if not self._valid_target(n, t, nodes):
                     continue
+                # 重复路线破局: 反复在同一处落子被互剪 → 硬性排除该落点。
+                # (仅软惩罚压不过互剪奖励 node_hit, 曾导致 AI 双方无限互剪同一落点。
+                #  过滤后 AI 被迫换路线, 路线变化时 similar_turns 自然重置。)
+                if self._in_repeat_zone(t[0], t[1], n.id):
+                    continue
                 d = _dist(n.x, n.y, t[0], t[1])
                 ri = _range_index(d)
                 if ri is None:
@@ -1816,13 +1821,19 @@ class AIThinker:
         return False, self._plan_viz()
 
     def _update_similar_turns(self, tx, ty, parent_id):
-        """更新重复路线计数：与上次操作"极度相似"(同父节点 + 目标 <60px) → +1，否则重置。
+        """记录本次落点并维护重复路线检测状态。
+
+        - recent_targets: 最近 5 次落点窗口 (x, y, parent_id)，用于检测互剪循环。
+        - similar_turns / last_target / last_parent_id: 兼容保留（score_target 软惩罚用）。
 
         所有产生 place_node 的决策出口统一调用（planner / 绝望兜底 / 紧急拾取），
         避免死循环检测只在 planner 路径生效、其他路径无限重复同一落点。
-        返回当前计数。
         """
         mem = self.mem
+        recent = mem.setdefault('recent_targets', [])
+        recent.append((tx, ty, parent_id))
+        if len(recent) > 5:
+            recent.pop(0)
         prev_t = mem.get('last_target')
         prev_p = mem.get('last_parent_id')
         same_parent = (prev_p is not None and parent_id == prev_p)
@@ -1834,15 +1845,23 @@ class AIThinker:
         mem['last_parent_id'] = parent_id
         return mem['similar_turns']
 
-    def _in_repeat_zone(self, tx, ty):
-        """similar_turns≥3 时，目标是否落在上次落点重复区域内（该区域已被重罚/需要绕开）。"""
-        mem = self.mem
-        if mem.get('similar_turns', 0) < 3:
+    def _in_repeat_zone(self, tx, ty, parent=None):
+        """目标是否落在重复落点区域内。
+
+        检测互剪循环: 最近 5 次落点中, 从同一父节点落在目标附近(<40px) ≥2 次 → 判定循环。
+        40px 严格阈值 + 同父过滤, 只命中"反复在同一处落子被互剪"的模式,
+        不会误伤链式推进 (每步换父节点) 或扇形扩张 (目标分散)。
+        """
+        recent = self.mem.get('recent_targets', [])
+        if len(recent) < 2:
             return False
-        last = mem.get('last_target')
-        if last is None:
-            return False
-        return _dist(tx, ty, last[0], last[1]) < 120
+        count = 0
+        for x, y, pid in recent:
+            if parent is not None and pid != parent:
+                continue
+            if (tx - x) ** 2 + (ty - y) ** 2 < 40 * 40:
+                count += 1
+        return count >= 2
 
     def finish_plan(self):
         """返回最终最优动作（精化后的 top1）。"""
@@ -1898,45 +1917,50 @@ class AIThinker:
             return None
         best = None
         best_score = -1e18
-        for n in expandables:
-            targets = self.gen_targets(n, nodes, en_root, pickups, light=True)
-            for t in targets:
-                tx, ty = t
-                if not self._in_bounds(tx, ty):
-                    continue
-                d = _dist(n.x, n.y, tx, ty)
-                if d < 20 or d > MAX_RANGE:
-                    continue
-                ri = _range_index(d)
-                if ri is None:
-                    continue
-                if ri > my_score:          # 绝望时也尽量不超预算
-                    continue
-                # 宽松间距: 允许最小 20px (节点半径 18, 几乎相切)
-                ok = True
-                for o in nodes:
-                    if o is n:
+        # 第一遍: 绕开重复落点; 若绕开后完全无解, 第二遍允许回落到原落点,
+        # 避免"所有候选都在重复区 → 无限让过回合"的停滞 (互剪至少还能推进对局)。
+        for attempt in (0, 1):
+            for n in expandables:
+                targets = self.gen_targets(n, nodes, en_root, pickups, light=True)
+                for t in targets:
+                    tx, ty = t
+                    if not self._in_bounds(tx, ty):
                         continue
-                    if (o.x - tx) ** 2 + (o.y - ty) ** 2 < 20 * 20:
-                        ok = False
-                        break
-                if not ok:
-                    continue
-                # 重复路线破局: 连续 ≥3 回合落同一区域 → 绕开该区域，强制换线
-                if self._in_repeat_zone(tx, ty):
-                    continue
-                # 优先能捡到点数包的落点
-                score = -d * 0.05
-                for sp in pickups:
-                    pd = _dist(tx, ty, sp.x, sp.y)
-                    if pd < PICKUP_COLLECT_DIST:
-                        score += 200.0 + sp.value * 60.0
-                    elif pd < 130:
-                        score += sp.value * 2.0 * (1.0 - pd / 130.0)
-                if score > best_score:
-                    best_score = score
-                    best = {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
-                            'strength': MIN_STRENGTH, 'range_index': ri}
+                    d = _dist(n.x, n.y, tx, ty)
+                    if d < 20 or d > MAX_RANGE:
+                        continue
+                    ri = _range_index(d)
+                    if ri is None:
+                        continue
+                    if ri > my_score:          # 绝望时也尽量不超预算
+                        continue
+                    # 宽松间距: 允许最小 20px (节点半径 18, 几乎相切)
+                    ok = True
+                    for o in nodes:
+                        if o is n:
+                            continue
+                        if (o.x - tx) ** 2 + (o.y - ty) ** 2 < 20 * 20:
+                            ok = False
+                            break
+                    if not ok:
+                        continue
+                    # 重复路线破局: 第一遍绕开反复落子被互剪的落点, 强制换线
+                    if attempt == 0 and self._in_repeat_zone(tx, ty, n.id):
+                        continue
+                    # 优先能捡到点数包的落点
+                    score = -d * 0.05
+                    for sp in pickups:
+                        pd = _dist(tx, ty, sp.x, sp.y)
+                        if pd < PICKUP_COLLECT_DIST:
+                            score += 200.0 + sp.value * 60.0
+                        elif pd < 130:
+                            score += sp.value * 2.0 * (1.0 - pd / 130.0)
+                    if score > best_score:
+                        best_score = score
+                        best = {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
+                                'strength': MIN_STRENGTH, 'range_index': ri}
+            if best is not None or attempt == 1:
+                break
         if best is not None:
             self.last_cands = [(best['parent'], best['x'], best['y'],
                                 best['strength'], best['range_index'], best_score)]
@@ -1971,8 +1995,8 @@ class AIThinker:
                     continue
                 if self._occupied(tx, ty, nodes, n):
                     continue
-                # 重复路线破局: 连续 ≥3 回合捡同一区域 → 换别的包/交给常规路径
-                if self._in_repeat_zone(tx, ty):
+                # 重复路线破局: 反复捡同一落点 → 换别的包/交给常规路径
+                if self._in_repeat_zone(tx, ty, n.id):
                     continue
                 # 朝敌根方向加分 (避免为捡包大幅绕路)
                 v1x = en_root.x - n.x
