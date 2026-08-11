@@ -27,6 +27,11 @@ replays/deleted/*
 # Local config (默认配置模板为 config.default.json，用户本地配置不提交)
 config.json
 
-# AI 运行时学习数据与权重备份（AI/ai.json 是共享默认权重，保留提交）
+# AI 运行时学习数据与权重备份（ai.json 为本地学习权重，不再提交；ai.json.default 为共享默认模板）
 AI/learn.json
 AI/backup/
+AI/ai.json
+!AI/ai.json.default
+
+# Other files
+*default*.*

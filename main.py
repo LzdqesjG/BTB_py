@@ -2894,7 +2894,10 @@ class Game:
         if removed_ids or weakened:
             play_sfx('shear')
         if winner:
-            if self.my_team:
+            if self._ai_vs_ai:
+                # AI 对弈模式：无论哪方获胜统一播放 heavy_hit
+                play_sfx('heavy_hit')
+            elif self.my_team:
                 play_sfx('victory' if self.my_team == winner else 'heavy_hit')
             else:
                 play_sfx('victory')
@@ -3056,7 +3059,11 @@ class Game:
             if removed_ids or weakened:
                 play_sfx('shear')
             if winner:
-                play_sfx('victory' if self.my_team == winner else 'heavy_hit')
+                # AI 对弈模式：无论哪方获胜统一播放 heavy_hit
+                if self._ai_vs_ai:
+                    play_sfx('heavy_hit')
+                else:
+                    play_sfx('victory' if self.my_team == winner else 'heavy_hit')
 
             # 不再允许切割后自动降级回收点数（人类不能降价，AI 也应遵守相同规则）
             self.has_created_this_turn = True
