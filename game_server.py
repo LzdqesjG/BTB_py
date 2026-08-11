@@ -19,6 +19,9 @@ class GameServer:
         self.running = False
         self.connected = False
 
+        # 网络线程与游戏主线程共享连接状态与 socket 发送，需加锁保护
+        self._lock = threading.Lock()
+
         # 主线程处理的动作队列
         self.action_queue = queue.Queue()
 
@@ -42,25 +45,29 @@ class GameServer:
     def stop(self):
         """停止服务器。"""
         self.running = False
-        self.connected = False
-        if self.client_sock:
-            try:
-                self.client_sock.close()
-            except Exception:
-                pass
-        if self._listen_sock:
-            try:
-                self._listen_sock.close()
-            except Exception:
-                pass
+        with self._lock:
+            self.connected = False
+            if self.client_sock:
+                try:
+                    self.client_sock.close()
+                except Exception:
+                    pass
+            if self._listen_sock:
+                try:
+                    self._listen_sock.close()
+                except Exception:
+                    pass
 
     def _listen_loop(self):
         """监听线程：等待客户端连接，然后处理消息。"""
         while self.running:
             try:
-                self.client_sock, self.client_addr = self._listen_sock.accept()
-                self.client_sock.settimeout(None)
-                self.connected = True
+                new_sock, addr = self._listen_sock.accept()
+                new_sock.settimeout(None)
+                with self._lock:
+                    self.client_sock = new_sock
+                    self.client_addr = addr
+                    self.connected = True
                 self._handle_client()
             except socket.timeout:
                 continue
@@ -74,7 +81,8 @@ class GameServer:
         while self.running and self.connected:
             data = proto.recv_line(self.client_sock)
             if data is None:
-                self.connected = False
+                with self._lock:
+                    self.connected = False
                 break
             cmd, params = proto.decode_msg(data)
             if cmd is None:
@@ -125,7 +133,7 @@ class GameServer:
             radius = int(params[4])
             strength = int(params[5])
         except (IndexError, ValueError):
-            self._send(proto.ERROR)
+            self._send(proto.ERROR, "参数错误")
             return
 
         game = self.game
@@ -133,7 +141,7 @@ class GameServer:
         # --- 反作弊校验 ---
         ok, reason = self.anti_cheat.check_place_node(px, py, x, y, radius, strength)
         if not ok:
-            self._send(proto.ERROR)
+            self._send(proto.ERROR, reason or "请求被拒绝")
             return
 
         # 安全获取 Node 类并找到父节点（反作弊已验证父节点存在）
@@ -200,7 +208,7 @@ class GameServer:
             nx, ny = float(params[0]), float(params[1])
             target_strength = int(params[2])
         except (IndexError, ValueError):
-            self._send(proto.ERROR)
+            self._send(proto.ERROR, "参数错误")
             return
 
         game = self.game
@@ -208,7 +216,7 @@ class GameServer:
         # --- 反作弊校验 ---
         ok, reason = self.anti_cheat.check_modify_branch(nx, ny, target_strength)
         if not ok:
-            self._send(proto.ERROR)
+            self._send(proto.ERROR, reason or "请求被拒绝")
             return
 
         # 找到目标节点（反作弊已验证存在）
@@ -239,7 +247,7 @@ class GameServer:
         # --- 反作弊校验 ---
         ok, reason = self.anti_cheat.check_end_turn()
         if not ok:
-            self._send(proto.ERROR)
+            self._send(proto.ERROR, reason or "请求被拒绝")
             return
         game._end_turn()
         # 广播回合切换
@@ -247,20 +255,26 @@ class GameServer:
 
     def send_state(self):
         """发送全量游戏状态给客户端。"""
-        if not self.connected or not self.client_sock:
-            return
+        with self._lock:
+            if not self.connected or not self.client_sock:
+                return
         json_str = proto.serialize_state(self.game)
         self._send(proto.STATE_SYNC, json_str)
 
     def _send(self, cmd, *params):
-        """发送消息给客户端。"""
-        if not self.client_sock:
-            return
-        try:
-            data = proto.encode_msg(cmd, *params)
-            self.client_sock.sendall(data)
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            self.connected = False
+        """发送消息给客户端。
+
+        服务器线程（JOIN/GET_MAP 响应）与主线程（动作广播）都会调用，
+        加锁防止对同一 socket 并发 sendall 导致数据交错。
+        """
+        with self._lock:
+            if not self.client_sock:
+                return
+            try:
+                data = proto.encode_msg(cmd, *params)
+                self.client_sock.sendall(data)
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                self.connected = False
 
     def _find_blue_node(self, x: float, y: float, require_parent: bool = False):
         """按坐标查找蓝队节点，容差 < 1 像素。"""

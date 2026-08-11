@@ -22,3 +22,6 @@ replays/deleted/*
 
 # backup files
 *.bak
+
+# Local config (默认配置模板为 config.default.json，用户本地配置不提交)
+config.json

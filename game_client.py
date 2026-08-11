@@ -24,6 +24,9 @@ class GameClient:
 
         self._thread = None
 
+        # 发送/关闭与网络接收线程共享 sock，加锁保护
+        self._lock = threading.Lock()
+
     def connect(self):
         """连接服务器，发送 JOIN。返回 (True, '') 或 (False, error_msg)。"""
         error_msg = ''
@@ -68,19 +71,21 @@ class GameClient:
     def stop(self):
         """停止客户端。"""
         self.running = False
-        self.connected = False
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
+        with self._lock:
+            self.connected = False
+            if self.sock:
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
 
     def _recv_loop(self):
         """接收线程：循环读取服务器消息。"""
         while self.running and self.connected:
             data = proto.recv_line(self.sock)
             if data is None:
-                self.connected = False
+                with self._lock:
+                    self.connected = False
                 break
             cmd, params = proto.decode_msg(data)
             if cmd is None:
@@ -96,6 +101,10 @@ class GameClient:
                 # 全量状态同步（向后兼容）
                 if params:
                     proto.deserialize_state(self.game, params[0])
+            elif cmd == proto.ERROR:
+                # 服务器拒绝请求：提示客户端，不改变本地状态
+                reason = params[0] if params else "请求被服务器拒绝"
+                self.game.show_net_error(reason)
             else:
                 # 增量动作
                 self.game.apply_action(cmd, params)
@@ -119,11 +128,12 @@ class GameClient:
         self._send(proto.BLUE_NEXT_TURN)
 
     def _send(self, cmd, *params):
-        """发送消息给服务器。"""
-        if not self.sock:
-            return
-        try:
-            data = proto.encode_msg(cmd, *params)
-            self.sock.sendall(data)
-        except (ConnectionResetError, BrokenPipeError, OSError):
-            self.connected = False
+        """发送消息给服务器（加锁防止与关闭操作并发导致竞态）。"""
+        with self._lock:
+            if not self.sock:
+                return
+            try:
+                data = proto.encode_msg(cmd, *params)
+                self.sock.sendall(data)
+            except (ConnectionResetError, BrokenPipeError, OSError):
+                self.connected = False

@@ -166,6 +166,8 @@ font_mid = get_font(22)
 font_small = get_font(16)
 font_tiny = get_font(13)
 
+REPLAY_PAGE_SIZE = 15  # 回放列表每页显示数量
+
 def randcolor(mode:str='all'):
     if mode == 'all':
         return (random.randint(0, 255), random.randint(0, 255), random.randint(0, 255))
@@ -389,9 +391,15 @@ class Game:
         self.ip_input = ''         # IP输入文本
         self.connect_error = None  # 连接错误信息
         self.host_port = DEFAULT_PORT
+        self.fps = FPS             # 当前帧率（可在设置页修改，实时生效）
 
         # 联机状态追踪（用于进出提示音）
         self._last_remote_connected = False
+
+        # 联机：等待服务器确认结束回合（避免拒绝后失同步）
+        self._end_turn_pending = False
+        # 联机：服务器拒绝提示（文本, 起始tick），None 表示无提示
+        self._net_error = None
 
         # AI 模式
         self._ai_mode = False
@@ -414,6 +422,7 @@ class Game:
         # 回放选择
         self._replay_files = []
         self._replay_selected = 0
+        self._replay_page = 0              # 回放列表当前页
         self._replay_row_rects = []        # 回放列表每行的矩形（鼠标点击用）
         self._last_replay_click_time = 0   # 双击检测
         self._last_replay_click_row = -1
@@ -568,6 +577,7 @@ class Game:
             self.current_team = params[0]
             self.has_created_this_turn = params[1] == 'True'
             self.turn_count = int(params[2])
+            self._end_turn_pending = False  # 服务器已确认回合切换
         elif cmd == proto.ACT_SYNC_POINTS:
             self.points['RED'] = int(params[0])
             self.points['BLUE'] = int(params[1])
@@ -582,6 +592,11 @@ class Game:
                 play_sfx('victory')
             else:
                 play_sfx('heavy_hit')
+
+    def show_net_error(self, message):
+        """客户端收到服务器 ERROR 时调用：底部显示红字提示（3秒后消失）。"""
+        self._net_error = (message, pygame.time.get_ticks())
+        print(f"[NET] 服务器拒绝: {message}")
 
     def _node_by_id(self, node_id):
         for n in self.nodes:
@@ -1731,6 +1746,15 @@ class Game:
             hint = font_tiny.render(f"提示: 拖动己方节点创建分支 | 右键树枝进入修改 | 空格切范围 | B吸附[{snap_label}] | Tab结束回合", True, DARK_GRAY)
         surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 15)))
 
+        # 网络错误提示（服务器拒绝请求时，红字显示3秒）
+        if self._net_error:
+            msg, err_tick = self._net_error
+            if pygame.time.get_ticks() - err_tick < 3000:
+                err = font_tiny.render(f"服务器拒绝: {msg}", True, (255, 90, 90))
+                surface.blit(err, err.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 32)))
+            else:
+                self._net_error = None
+
         # 树枝修改模式覆盖层
         if self._branch_modify_mode and self._branch_modify_target:
             self._draw_branch_modify_overlay(surface)
@@ -1817,6 +1841,8 @@ class Game:
             self._handle_replay_select_event(event)
         elif self.state == STATE_REPLAY_PLAY:
             self._handle_replay_play_event(event)
+        elif self.state == STATE_SETTINGS:
+            self._handle_settings_event(event)
         elif self.state == STATE_PLAYING:
             self._handle_playing_event(event)
 
@@ -1846,7 +1872,7 @@ class Game:
                 return
         else:
             host = ip
-            port = DEFAULT_PORT
+            port = self.host_port
 
         self.net_client = GameClient(self, host, port)
         success, err_msg = self.net_client.connect()
@@ -1881,11 +1907,130 @@ class Game:
                 self._enter_replay_select()
             elif hasattr(self, '_btn_settings') and self._btn_settings.collidepoint(event.pos):
                 play_sfx('click')
-                # 设置：预留
+                self._enter_settings()
             elif hasattr(self, '_btn_exit') and self._btn_exit.collidepoint(event.pos):
                 play_sfx('click')
                 pygame.quit()
                 sys.exit()
+
+    # ===== 设置页 =====
+
+    def _enter_settings(self):
+        """进入设置页：从 config.json 读取当前值。"""
+        import json
+        cfg_path = os.path.join(os.path.dirname(__file__), 'config.json')
+        cfg = {}
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                cfg = {}
+        self._settings_fps = cfg.get('display', {}).get('fps', FPS)
+        self._settings_ai_frames = cfg.get('ai', {}).get('think_delay_frames', AI_THINK_DELAY)
+        self._settings_port = cfg.get('network', {}).get('default_port', DEFAULT_PORT)
+        # AI 思考时间上限 1.5s
+        max_frames = max(1, int(self._settings_fps * 1.5))
+        self._settings_ai_frames = min(self._settings_ai_frames, max_frames)
+        self._settings_index = 0  # 0=FPS 1=AI思考时间 2=端口
+        self.state = STATE_SETTINGS
+
+    def _handle_settings_event(self, event):
+        if event.type == pygame.QUIT:
+            pygame.quit()
+            sys.exit()
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                play_sfx('click')
+                self.state = STATE_MENU
+                return
+            if event.key in (pygame.K_UP, pygame.K_w):
+                self._settings_index = (self._settings_index - 1) % 3
+                play_sfx('tap', strength=2)
+            elif event.key in (pygame.K_DOWN, pygame.K_s):
+                self._settings_index = (self._settings_index + 1) % 3
+                play_sfx('tap', strength=2)
+            elif event.key in (pygame.K_LEFT, pygame.K_a):
+                self._adjust_setting(-1)
+            elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                self._adjust_setting(1)
+        elif event.type == pygame.MOUSEWHEEL:
+            if event.y > 0:
+                self._settings_index = (self._settings_index - 1) % 3
+            else:
+                self._settings_index = (self._settings_index + 1) % 3
+            play_sfx('tap', strength=2)
+
+    def _adjust_setting(self, direction):
+        """调整当前选中项（direction=-1 减少 / +1 增加），改后立即保存并应用。"""
+        if self._settings_index == 0:      # 最高 FPS
+            self._settings_fps = max(15, min(240, self._settings_fps + direction * 5))
+        elif self._settings_index == 1:    # AI 思考时间（秒，上限 1.5s）
+            fps = self._settings_fps
+            seconds = self._settings_ai_frames / fps
+            seconds = max(0.05, min(1.5, round(seconds + direction * 0.05, 2)))
+            self._settings_ai_frames = max(1, min(int(fps * 1.5), round(seconds * fps)))
+        else:                              # 默认端口
+            self._settings_port = max(1024, min(65535, self._settings_port + direction))
+        play_sfx('tap', strength=2)
+        self._apply_settings()
+
+    def _apply_settings(self):
+        """先写入当前运行变量，再写回 config.json。"""
+        # 当前运行变量
+        self.fps = self._settings_fps
+        self._AI_THINK_DELAY = self._settings_ai_frames
+        self.host_port = self._settings_port
+        # 写回配置文件（原子写，避免写坏）
+        import json
+        cfg_path = os.path.join(os.path.dirname(__file__), 'config.json')
+        cfg = {}
+        if os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                cfg = {}
+        cfg.setdefault('display', {})['fps'] = self._settings_fps
+        cfg.setdefault('ai', {})['think_delay_frames'] = self._settings_ai_frames
+        cfg.setdefault('network', {})['default_port'] = self._settings_port
+        try:
+            tmp = cfg_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, cfg_path)
+        except OSError as e:
+            print(f"[CONFIG] 保存配置失败: {e}")
+
+    def draw_settings(self, surface):
+        surface.fill(BG_COLOR)
+        title = font_big.render("设置", True, WHITE)
+        surface.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 120)))
+
+        fps = self._settings_fps
+        ai_frames = self._settings_ai_frames
+        ai_seconds = ai_frames / fps if fps else 0
+        rows = [
+            (0, f"最高 FPS: {fps}", "实时生效"),
+            (1, f"AI 思考时间: {ai_seconds:.2f}s ({ai_frames}帧)", "上限 1.5s，实时生效"),
+            (2, f"默认端口: {self._settings_port}", "下次建房/连接生效"),
+        ]
+        y = 220
+        for idx, label, desc in rows:
+            if idx == self._settings_index:
+                color = (255, 215, 0)
+                prefix = "> "
+            else:
+                color = WHITE
+                prefix = "  "
+            txt = font_mid.render(prefix + label, True, color)
+            surface.blit(txt, (SCREEN_WIDTH // 2 - 170, y))
+            d = font_small.render(desc, True, GRAY)
+            surface.blit(d, (SCREEN_WIDTH // 2 + 110, y + 5))
+            y += 48
+
+        tip = font_tiny.render("↑/↓ 选择 | ←/→ 调整（修改立即保存） | Esc 返回", True, DARK_GRAY)
+        surface.blit(tip, tip.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 40)))
 
     def _enter_replay_select(self):
         """进入回放文件选择界面。解析每个回放的步数和胜者。"""
@@ -1902,6 +2047,7 @@ class Game:
         else:
             self._replay_files = []
         self._replay_selected = 0
+        self._replay_page = 0
         self._replay_delete_mode = False
         self.state = STATE_REPLAY_SELECT
 
@@ -2494,13 +2640,18 @@ class Game:
                          (int(bx), int(by)), 2)
 
     def _end_turn(self):
-        # 客户端模式：发送结束回合请求给服务器
+        # 客户端模式：发送结束回合请求给服务器，等 ACT_SYNC_TURN 确认后再更新状态
         if self.network_mode == 'client' and self.net_client:
+            if self._end_turn_pending:
+                return  # 已在等待服务器确认，避免重复发送
             self.net_client.send_end_turn()
-            self.has_created_this_turn = False
+            self._end_turn_pending = True
+            # 清除纯 UI 状态（不影响服务器同步，has_created_this_turn 等游戏状态等确认）
             self.dragging = False
             self.drag_node = None
             self.hovered_branch_child = None
+            self._branch_modify_mode = False
+            self._branch_modify_target = None
             return
 
         self.has_created_this_turn = False
@@ -2540,6 +2691,8 @@ class Game:
             self.draw_replay_select(surface)
         elif self.state == STATE_REPLAY_PLAY:
             self.draw_replay_play(surface)
+        elif self.state == STATE_SETTINGS:
+            self.draw_settings(surface)
         else:
             self.draw_playing(surface)
 
@@ -2683,16 +2836,17 @@ class Game:
             surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)))
         else:
             list_start_y = 120
-            visible_count = min(len(self._replay_files), 15)
-            for i in range(visible_count):
-                idx = i
-                if idx >= len(self._replay_files):
-                    break
-                fname, steps, winner_label, mode_label = self._replay_files[idx]
-                y = list_start_y + i * 32
-                is_selected = (idx == self._replay_selected)
+            total_pages = max(1, (len(self._replay_files) + REPLAY_PAGE_SIZE - 1) // REPLAY_PAGE_SIZE)
+            if self._replay_page >= total_pages:
+                self._replay_page = total_pages - 1
+            page_start = self._replay_page * REPLAY_PAGE_SIZE
+            page_end = min(page_start + REPLAY_PAGE_SIZE, len(self._replay_files))
+            for i in range(page_start, page_end):
+                fname, steps, winner_label, mode_label = self._replay_files[i]
+                y = list_start_y + (i - page_start) * 32
+                is_selected = (i == self._replay_selected)
                 row = pygame.Rect(SCREEN_WIDTH // 2 - 300, y - 2, 600, 28)
-                self._replay_row_rects.append(row)
+                self._replay_row_rects.append((row, i))
                 is_hover = row.collidepoint(mouse_pos)
 
                 # 选中/悬停高亮
@@ -2723,6 +2877,36 @@ class Game:
                 meta_rect = meta_txt.get_rect()
                 surface.blit(meta_txt, (SCREEN_WIDTH // 2 + 290 - meta_rect.width, y + _offset))
 
+            # 页码 + 翻页按钮（鼠标可点，键盘 ←→ 也可）
+            has_prev = self._replay_page > 0
+            has_next = self._replay_page < total_pages - 1
+            py_center = SCREEN_HEIGHT - 78
+
+            prev_rect = pygame.Rect(SCREEN_WIDTH // 2 - 220, py_center - 14, 90, 28)
+            hp = prev_rect.collidepoint(mouse_pos)
+            pygame.draw.rect(surface, (70, 70, 95) if hp and has_prev else (45, 45, 60),
+                             prev_rect, border_radius=6)
+            pygame.draw.rect(surface, WHITE if has_prev else (80, 80, 80),
+                             prev_rect, 1, border_radius=6)
+            pt = font_small.render("<< 上一页", True, WHITE if has_prev else GRAY)
+            surface.blit(pt, pt.get_rect(center=prev_rect.center))
+            self._replay_page_prev_rect = prev_rect if has_prev else None
+
+            page_txt = font_tiny.render(
+                f"第 {self._replay_page + 1}/{total_pages} 页（共 {len(self._replay_files)} 个）",
+                True, DARK_GRAY)
+            surface.blit(page_txt, page_txt.get_rect(center=(SCREEN_WIDTH // 2, py_center)))
+
+            next_rect = pygame.Rect(SCREEN_WIDTH // 2 + 130, py_center - 14, 90, 28)
+            hn = next_rect.collidepoint(mouse_pos)
+            pygame.draw.rect(surface, (70, 70, 95) if hn and has_next else (45, 45, 60),
+                             next_rect, border_radius=6)
+            pygame.draw.rect(surface, WHITE if has_next else (80, 80, 80),
+                             next_rect, 1, border_radius=6)
+            nt = font_small.render("下一页 >>", True, WHITE if has_next else GRAY)
+            surface.blit(nt, nt.get_rect(center=next_rect.center))
+            self._replay_page_next_rect = next_rect if has_next else None
+
         # 底部按钮：返回 / 删除
         back_rect = pygame.Rect(SCREEN_WIDTH // 2 - 300, SCREEN_HEIGHT - 46, 90, 32)
         h = back_rect.collidepoint(mouse_pos)
@@ -2748,9 +2932,9 @@ class Game:
 
         # 底部提示
         if self._replay_delete_mode:
-            hint = font_tiny.render("单击选择 / 点【确认删除】删除 | ↑↓ 选择  Tab 删除  Esc 退出", True, (255, 80, 80))
+            hint = font_tiny.render("单击选择 / 点【确认删除】删除 | ↑↓ 选择  ←→ 翻页  Enter/Tab 删除  Esc 退出", True, (255, 80, 80))
         else:
-            hint = font_tiny.render("单击选择 / 双击播放 | ↑↓ 选择  Enter 播放  Esc 返回", True, DARK_GRAY)
+            hint = font_tiny.render("单击选择 / 双击播放 | ↑↓ 选择  ←→ 翻页  Enter 播放  Esc 返回", True, DARK_GRAY)
         surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 20)))
 
     def _handle_replay_select_event(self, event):
@@ -2759,12 +2943,12 @@ class Game:
             pygame.quit()
             sys.exit()
         if event.type == pygame.KEYDOWN:
-            # 删除模式：Del 退出，Tab 确认删除
+            # 删除模式：Del 退出，Enter/Tab 确认删除
             if self._replay_delete_mode:
                 if event.key == pygame.K_DELETE:
                     self._replay_delete_mode = False
                     return
-                if event.key == pygame.K_TAB:
+                if event.key in (pygame.K_TAB, pygame.K_RETURN):
                     self._do_replay_delete()
                     return
                 if event.key == pygame.K_ESCAPE:
@@ -2775,12 +2959,20 @@ class Game:
                         n = len(self._replay_files)
                         delta = -1 if event.key == pygame.K_UP else 1
                         self._replay_selected = (self._replay_selected + delta) % n
+                        self._replay_page = self._replay_selected // REPLAY_PAGE_SIZE
                         play_sfx('click')
+                    return
+                if event.key in (pygame.K_LEFT, pygame.K_RIGHT):
+                    self._replay_flip_page(-1 if event.key == pygame.K_LEFT else 1)
                     return
                 return  # 删除模式下忽略其他按键
 
             if event.key == pygame.K_ESCAPE:
                 self.state = STATE_MENU
+            elif event.key in (pygame.K_LEFT, pygame.K_PAGEUP):
+                self._replay_flip_page(-1)
+            elif event.key in (pygame.K_RIGHT, pygame.K_PAGEDOWN):
+                self._replay_flip_page(1)
             elif event.key == pygame.K_DELETE:
                 if self._replay_files:
                     self._replay_delete_mode = True
@@ -2789,6 +2981,7 @@ class Game:
                     n = len(self._replay_files)
                     delta = -1 if event.key == pygame.K_UP else 1
                     self._replay_selected = (self._replay_selected + delta) % n
+                    self._replay_page = self._replay_selected // REPLAY_PAGE_SIZE
                     play_sfx('click')
             elif event.key == pygame.K_RETURN:
                 if self._replay_files:
@@ -2799,11 +2992,21 @@ class Game:
                 n = len(self._replay_files)
                 delta = -1 if event.y > 0 else 1  # 上滚=上移=索引减
                 self._replay_selected = (self._replay_selected + delta) % n
+                self._replay_page = self._replay_selected // REPLAY_PAGE_SIZE
                 play_sfx('click')
 
         # 鼠标操作：单击选择 / 双击播放 / 按钮
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mp = event.pos
+            # 翻页按钮
+            if getattr(self, '_replay_page_prev_rect', None) and self._replay_page_prev_rect.collidepoint(mp):
+                play_sfx('click')
+                self._replay_flip_page(-1)
+                return
+            if getattr(self, '_replay_page_next_rect', None) and self._replay_page_next_rect.collidepoint(mp):
+                play_sfx('click')
+                self._replay_flip_page(1)
+                return
             # 返回按钮
             if hasattr(self, '_replay_sel_back_rect') and self._replay_sel_back_rect.collidepoint(mp):
                 play_sfx('click')
@@ -2821,21 +3024,30 @@ class Game:
                 return
             # 点击行：选择 / 双击开始播放
             now = pygame.time.get_ticks()
-            for i, rect in enumerate(getattr(self, '_replay_row_rects', [])):
-                if rect.collidepoint(mp):
-                    if self._replay_selected != i:
-                        self._replay_selected = i
+            for row, idx in getattr(self, '_replay_row_rects', []):
+                if row.collidepoint(mp):
+                    if self._replay_selected != idx:
+                        self._replay_selected = idx
                         play_sfx('click')
                     # 双击播放（删除模式下禁用）
                     if (not self._replay_delete_mode
                             and now - getattr(self, '_last_replay_click_time', 0) < 500
-                            and getattr(self, '_last_replay_click_row', -1) == i):
+                            and getattr(self, '_last_replay_click_row', -1) == idx):
                         play_sfx('click')
-                        self._start_replay(self._replay_files[i][0])
+                        self._start_replay(self._replay_files[idx][0])
                     self._last_replay_click_time = now
-                    self._last_replay_click_row = i
+                    self._last_replay_click_row = idx
                     return
             self._last_replay_click_time = 0
+
+    def _replay_flip_page(self, delta):
+        """回放列表翻页（delta=-1 上一页 / +1 下一页），选中跳到新页首行。"""
+        if not self._replay_files:
+            return
+        total_pages = max(1, (len(self._replay_files) + REPLAY_PAGE_SIZE - 1) // REPLAY_PAGE_SIZE)
+        self._replay_page = max(0, min(total_pages - 1, self._replay_page + delta))
+        self._replay_selected = self._replay_page * REPLAY_PAGE_SIZE
+        play_sfx('click')
 
     def _do_replay_delete(self):
         """删除当前选中的回放文件（移入 deleted 目录）。
@@ -2857,6 +3069,7 @@ class Game:
             if self._replay_files:
                 self._replay_selected = min(self._replay_selected,
                                             len(self._replay_files) - 1)
+            self._replay_page = self._replay_selected // REPLAY_PAGE_SIZE
             return
         del_dir = os.path.join(os.path.dirname(__file__), 'replays', 'deleted')
         os.makedirs(del_dir, exist_ok=True)
@@ -2867,6 +3080,7 @@ class Game:
         if self._replay_files:
             self._replay_selected = min(self._replay_selected,
                                         len(self._replay_files) - 1)
+        self._replay_page = self._replay_selected // REPLAY_PAGE_SIZE
 
     def _start_replay(self, filename):
         """加载回放文件，分组为步骤，构建初始棋盘。"""
@@ -3353,7 +3567,7 @@ def main():
         game.update()
         game.draw(screen)
         pygame.display.flip()
-        clock.tick(FPS)
+        clock.tick(game.fps)
 
 
 if __name__ == "__main__":

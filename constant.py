@@ -8,8 +8,22 @@ AUTHOR = "Lzdqesj"
 
 
 def _load_config():
-    """从 config.json 加载配置，不存在则返回空 dict。"""
-    _cfg_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    """从 config.json 加载配置。
+
+    若 config.json 不存在，则从 config.default.json 复制一份默认配置，
+    保证首次运行时也能拿到完整的配置项。两者都不存在时返回空 dict。
+    """
+    _base_dir = os.path.dirname(__file__)
+    _cfg_path = os.path.join(_base_dir, 'config.json')
+    if not os.path.isfile(_cfg_path):
+        _default_path = os.path.join(_base_dir, 'config.default.json')
+        if os.path.isfile(_default_path):
+            try:
+                import shutil
+                shutil.copyfile(_default_path, _cfg_path)
+                print(f"[CONFIG] config.json 不存在，已从 config.default.json 复制默认配置")
+            except OSError as _e:
+                print(f"[CONFIG] 复制默认配置失败: {_e}")
     if os.path.isfile(_cfg_path):
         with open(_cfg_path, 'r', encoding='utf-8') as _f:
             return json.load(_f)
@@ -77,6 +91,7 @@ STATE_JOIN_INPUT = 'join_input'    # 客户端输入IP
 STATE_CONNECTING = 'connecting'    # 客户端连接中
 STATE_REPLAY_SELECT = 'replay_select'  # 回放文件选择
 STATE_REPLAY_PLAY = 'replay_play'      # 回放播放中
+STATE_SETTINGS = 'settings'            # 设置页
 DEFAULT_PORT = _config.get('network', {}).get('default_port', 8447)
 
 # ===== 音效配置 =====
