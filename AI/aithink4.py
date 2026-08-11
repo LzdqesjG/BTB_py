@@ -966,40 +966,60 @@ class AIThinker:
     # 强制杀根检测
     # ============================================================
     def find_kill_move(self, nodes, my_score):
+        """强制杀根: 预算内可一步穿过敌根 → 直接取胜 (最高优先级)。
+
+        搜索范围比早期版本更广: 除了敌根正后方轴线, 还采样根后方两侧扇区,
+        避免轴线落点被占用时白白错过胜机。选最省钱的杀根 (range 档位最小)。
+        """
         if self.my_root is None or self.en_root is None:
             self._find_roots()
         if self.sit is None:
             self.sit = self.analyze_situation()
         en_root = self.en_root
-        # 杀根是一击制胜, 值得花光所有点数 (不再受保底限制)
-        for n in nodes:
-            if n.team != self.team or len(n.children) >= MAX_CHILDREN:
-                continue
+        best = None
+        best_ri = 99
+        # 己方可扩展节点按到敌根距离排序 (近的优先找到更省钱的解)
+        cands_n = [n for n in nodes
+                   if n.team == self.team and len(n.children) < MAX_CHILDREN]
+        cands_n.sort(key=lambda n: math.hypot(en_root.x - n.x, en_root.y - n.y))
+        # 根后方落点距离档位: 40 起步 (最小间距正好 40), 覆盖 range 120~240 各档
+        dists = (40.0, 51.0, 62.0, 73.0, 84.0, 95.0, 106.0, 117.0,
+                 128.0, 139.0, 150.0, 161.0)
+        # 落点偏转角 (弧度): 0 = 根正后方, 两侧扇区采样 (穿过根圆的落点不一定在轴线上)
+        angles = (0.0, -0.15, 0.15, -0.3, 0.3, -0.5, 0.5, -0.75, 0.75)
+        for n in cands_n:
             dx = en_root.x - n.x
             dy = en_root.y - n.y
             L = math.hypot(dx, dy)
-            if L < 25 or L > MAX_RANGE:
+            if L < 18 or L >= MAX_RANGE:
                 continue
             ux, uy = dx / L, dy / L
-            # 根后方落点 (分支穿过根)。间距限制 ~40, 从 42 起步。
-            for extra in (42.0, 58.0, 74.0, 90.0):
-                d = L + extra
-                if d > MAX_RANGE:
-                    continue
-                tx, ty = n.x + ux * d, n.y + uy * d
-                if not self._in_bounds(tx, ty):
-                    continue
-                if self._occupied(tx, ty, nodes, n):
-                    continue
-                ri = _range_index(d)
-                if ri is None:
-                    continue
-                if ri > my_score:
-                    continue
-                if _seg_hits_circle(n.x, n.y, tx, ty, en_root.x, en_root.y, NODE_RADIUS):
-                    self.last_cands = [(n, tx, ty, MIN_STRENGTH, ri, 99999.0)]
-                    return {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
-                            'strength': MIN_STRENGTH, 'range_index': ri}
+            for ang in angles:
+                ca, sa = math.cos(ang), math.sin(ang)
+                vx = ux * ca - uy * sa
+                vy = ux * sa + uy * ca
+                for extra in dists:
+                    d = L + extra
+                    if d > MAX_RANGE:
+                        break   # dists 递增, 后续更远
+                    ri = _range_index(d)
+                    if ri is None or ri > my_score or ri >= best_ri:
+                        continue
+                    tx, ty = n.x + vx * d, n.y + vy * d
+                    if not self._in_bounds(tx, ty):
+                        continue
+                    if self._occupied(tx, ty, nodes, n):
+                        continue
+                    if not _seg_hits_circle(n.x, n.y, tx, ty,
+                                            en_root.x, en_root.y, NODE_RADIUS):
+                        continue
+                    best_ri = ri
+                    best = (n, tx, ty, ri)
+        if best is not None:
+            n, tx, ty, ri = best
+            self.last_cands = [(n, tx, ty, MIN_STRENGTH, ri, 99999.0)]
+            return {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
+                    'strength': MIN_STRENGTH, 'range_index': ri}
         return None
 
     # ============================================================
