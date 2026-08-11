@@ -23,6 +23,7 @@
   - [anti_cheat.py - 反作弊](#anti_cheatpy---反作弊)
   - [AI/aithink4.py - AI 系统](#aiaithink4py---ai-系统)
   - [AI 自动学习](#ai-自动学习17)
+  - [AI 托管](#ai-托管30)
   - [replay.py - 回放系统](#replaypy---回放系统)
 - [联机架构](#联机架构)
   - [网络拓扑](#网络拓扑)
@@ -470,6 +471,21 @@ AI 有三层学习能力，全部以 `AI/ai.json`（权重）和 `AI/learn.json`
 ```bash
 python dev/rl_evolve.py --games 8 --mutation 0.12 --seed 42
 ```
+
+### AI 托管（#30）
+
+**用途**：AI 对战模式中，玩家可把自己的队伍交给 AI 控制（双 AI 对弈），常用于观战/挂机。
+
+**开关**：游戏界面左下角按钮 `AI托管: 关/开`（仅鼠标点击，**不绑快捷键**）；结束回合按钮也位于左下角（`结束回合 (Tab)`，Tab 快捷键保留）。
+
+**允许模式**：由 `constant.py` 的 `AI_CUSTODY_ALLOWED_MODES` 元组控制，目前仅 `'ai'`（AI 对战）允许，单人模式禁止使用。如需开放其他模式，往元组里追加对应模式标识即可。
+
+**实现要点**（[main.py](main.py)）：
+- `Game._ai_custody`：当前是否托管玩家队，`reset()` 时每局重置为 False
+- `update()` / `_ai_update()`：托管后玩家队也走 AI 决策，双 AI 交替推进
+- `_ai_update()` 创建 `AIThinker` 后立即 `ai.team = self.current_team` / `ai.enemy_team = ...`（按**当前回合队伍**，而非固定的 `_ai_team`）—— 否则托管玩家队时 `decide_action()` 会把己方行动当成对手行动，回合卡死
+- `Game._ai_memory_by_team`：托管双 AI 时按队伍隔离记忆，避免两个 AI 互相污染
+- `is_my_turn`：托管期间玩家队回合判定为 False，阻止人类输入干扰 AI 操作
 
 ### replay.py - 回放系统
 

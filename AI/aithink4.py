@@ -436,6 +436,13 @@ class AIThinker:
 
     # ---------- 记忆 ----------
     def _memory(self):
+        # 双 AI（AI 对战 + 玩家托管）时按队伍隔离记忆，避免两个 AI 互相污染
+        by_team = getattr(self.game, '_ai_memory_by_team', None)
+        if isinstance(by_team, dict):
+            team = self.team
+            if team not in by_team:
+                by_team[team] = {}
+            return by_team[team]
         mem = getattr(self.game, '_ai_memory', None)
         if not isinstance(mem, dict):
             mem = {}

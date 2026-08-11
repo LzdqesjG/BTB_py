@@ -379,8 +379,9 @@ class Game:
         self.pickups = []
         self.score_popups = []
 
-        # 结束回合按钮
-        self.end_turn_rect = pygame.Rect(SCREEN_WIDTH - 195, SCREEN_HEIGHT - 60, 175, 42)
+        # 结束回合按钮（左下角）与 AI 托管按钮（仅 AI 对战模式显示）
+        self.end_turn_rect = pygame.Rect(10, SCREEN_HEIGHT - 58, 150, 42)
+        self.ai_custody_rect = pygame.Rect(168, SCREEN_HEIGHT - 58, 140, 42)
         self.menu_btn_rect = pygame.Rect(SCREEN_WIDTH // 2 - 90, SCREEN_HEIGHT // 2 + 110, 180, 50)
 
         # 网络模式
@@ -405,9 +406,11 @@ class Game:
         self._ai_mode = False
         self._ai_team = None          # AI 控制的队伍
         self._ai_think_timer = 0
-        self._AI_THINK_DELAY = AI_THINK_DELAY
+        self._AI_THINK_DELAY = max(1, AI_THINK_DELAY)  # 至少 1 帧，防止思考进度除零崩溃
         self._ai_debug_candidates = []  # AI 候选可视化数据
         self._ai_memory = {}          # AI 跨回合记忆
+        self._ai_memory_by_team = {'RED': {}, 'BLUE': {}}  # 托管双 AI 时按队伍隔离记忆
+        self._ai_custody = False      # 玩家队伍是否交给 AI 托管（仅 AI 对战模式可用）
         self._ai_post_reinforce = 0   # 本回合放置后已强化的次数
         self._idle_played_key = None  # 已播放过 idle 的回合标识
         self._resume_from_replay = False
@@ -449,6 +452,8 @@ class Game:
         self.has_created_this_turn = False
         self.hovered_branch_child = None
         self._ai_memory = {}  # 每局重置 AI 记忆
+        self._ai_memory_by_team = {'RED': {}, 'BLUE': {}}  # 每局重置按队伍记忆
+        self._ai_custody = False      # 新对局关闭 AI 托管
         self._ai_post_reinforce = 0
         self._idle_played_key = None
         self._ai_learned = False      # 新对局重置 AI 学习标志
@@ -808,8 +813,9 @@ class Game:
         self._update_hovered_branch()
         self.score_popups = [p for p in self.score_popups if p.is_alive()]
 
-        # AI 模式：AI 回合自动操作
-        if self._ai_mode and self.current_team == self._ai_team:
+        # AI 回合自动操作：AI 模式的 AI 队，或玩家开启托管后的自己队伍
+        if self._ai_mode and (self.current_team == self._ai_team
+                              or (self._ai_custody and self.current_team == self.my_team)):
             self._ai_update()
 
         # 房主：游戏结束时通知客户端
@@ -1747,7 +1753,7 @@ class Game:
                 ts2 = font_tiny.render("  ".join(warn), True, (255, 100, 100))
                 surface.blit(ts2, ts2.get_rect(center=(SCREEN_WIDTH // 2, tip_y + 20)))
 
-        # 结束回合按钮
+        # 结束回合按钮（左下角）
         mouse_pos = pygame.mouse.get_pos()
         hover = self.end_turn_rect.collidepoint(mouse_pos)
         bc = DARK_GRAY if not hover else (80, 80, 120)
@@ -1756,8 +1762,20 @@ class Game:
         et = font_small.render("结束回合 (Tab)", True, WHITE)
         surface.blit(et, et.get_rect(center=self.end_turn_rect.center))
 
+        # AI 托管按钮（左下角，仅 AI 对战模式且配置允许时显示）
+        if 'ai' in AI_CUSTODY_ALLOWED_MODES and self._ai_mode:
+            hover2 = self.ai_custody_rect.collidepoint(mouse_pos)
+            bc2 = (70, 90, 70) if self._ai_custody else (DARK_GRAY if not hover2 else (80, 80, 120))
+            pygame.draw.rect(surface, bc2, self.ai_custody_rect, border_radius=6)
+            pygame.draw.rect(surface, (140, 255, 140) if self._ai_custody else WHITE,
+                             self.ai_custody_rect, 2, border_radius=6)
+            label2 = "AI托管: 开" if self._ai_custody else "AI托管: 关"
+            et2 = font_small.render(label2, True, (140, 255, 140) if self._ai_custody else WHITE)
+            surface.blit(et2, et2.get_rect(center=self.ai_custody_rect.center))
+
         # 底部提示
-        if self._ai_mode and self.current_team == self._ai_team:
+        if self._ai_mode and (self.current_team == self._ai_team
+                              or (self._ai_custody and self.current_team == self.my_team)):
             pct = int(self._ai_think_timer / self._AI_THINK_DELAY * 100)
             progress_label = f"AI 思考中... ({pct}%)" if self._ai_think_timer > 0 else "AI 思考中..."
             hint = font_tiny.render(progress_label, True, (200, 160, 60))
@@ -2217,7 +2235,9 @@ class Game:
                 play_sfx('click')
                 self.go_menu()
 
-    def _handle_playing_event(self, event):
+    def _handle_playing_event(self, event: pygame.event.Event):
+        # if event.type == pygame.KEYDOWN:
+        #     rprint(event.key)
         if event.type == pygame.QUIT:
             pygame.quit()
             sys.exit()
@@ -2229,6 +2249,21 @@ class Game:
                 self.go_menu()
                 return
 
+        # AI 托管按钮（左下角，仅 AI 对战模式且配置允许时显示；不绑快捷键）
+        if ('ai' in AI_CUSTODY_ALLOWED_MODES and self._ai_mode
+                and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                and self.ai_custody_rect.collidepoint(event.pos)):
+            play_sfx('click')
+            self._ai_custody = not self._ai_custody
+            # 切换时清理拖拽 / 待执行 AI 动作 / 修改模式，避免残留状态
+            self._ai_pending_action = None
+            self._ai_anim_timer = 0
+            self.dragging = False
+            self.drag_node = None
+            self._branch_modify_mode = False
+            self._branch_modify_target = None
+            return
+
         # 树枝修改模式：拦截所有输入
         if self._branch_modify_mode:
             self._handle_branch_modify_event(event)
@@ -2236,7 +2271,10 @@ class Game:
 
         # 网络模式/AI模式：非己方回合时只允许鼠标移动
         if self._ai_mode:
-            is_my_turn = (self.current_team != self._ai_team)
+            if self._ai_custody and self.current_team == self.my_team:
+                is_my_turn = False  # 玩家队伍已托管，交给 AI 操作
+            else:
+                is_my_turn = (self.current_team != self._ai_team)
         else:
             is_my_turn = (self.network_mode is None or self.current_team == self.my_team)
 
@@ -2244,7 +2282,7 @@ class Game:
             self.mouse_x, self.mouse_y = event.pos
 
         # B 键：切换自动吸附（全局，任意时机）
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_b:
+        if event.type == pygame.KEYDOWN and (event.key == pygame.K_b):
             self._snap_enabled = not self._snap_enabled
             play_sfx('click')
 
@@ -2516,6 +2554,8 @@ class Game:
             if self._ai_post_reinforce < 2:
                 try:
                     ai = AIThinker(self)
+                    ai.team = self.current_team  # 托管时按当前回合队伍，不锁定 _ai_team
+                    ai.enemy_team = 'BLUE' if ai.team == 'RED' else 'RED'
                     edge = ai.choose_reinforce(
                         self.nodes, self.points[self.current_team],
                         self.points['RED' if self.current_team == 'BLUE' else 'BLUE'])
@@ -2536,6 +2576,8 @@ class Game:
             return
 
         ai = AIThinker(self)
+        ai.team = self.current_team  # 托管时按当前回合队伍，不锁定 _ai_team
+        ai.enemy_team = 'BLUE' if ai.team == 'RED' else 'RED'
         action = ai.decide_action()
 
         if action is None:

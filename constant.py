@@ -46,6 +46,11 @@ RANGE_OPTIONS = [120, 160, 200, 240]  # 可选范围半径，空格循环切换
 # AI
 AI_THINK_DELAY = _config.get('ai', {}).get('think_delay_frames', 90)
 
+# ===== AI 托管 =====
+# 允许使用 AI 托管功能的模式。目前仅 AI 对战模式 ('ai') 允许，单人模式禁止使用。
+# 如需开放其他模式，在此元组中追加对应标识即可。
+AI_CUSTODY_ALLOWED_MODES = ('ai',)
+
 # 点数包常量
 PICKUP_RADIUS = _config.get('pickup', {}).get('radius', 13)
 PICKUP_MIN_ROOT_DIST = _config.get('pickup', {}).get('min_root_distance', 160)
