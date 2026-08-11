@@ -415,6 +415,7 @@ class Game:
         self._ai_custody = False      # 玩家队伍是否交给 AI 托管（仅 AI 对战模式可用）
         self._ai_vs_ai = False        # AI 对弈模式：双 AI 自动对局（纯训练数据）
         self._ai_post_reinforce = 0   # 本回合放置后已强化的次数
+        self._ai_game_over_sfx_played = False  # AI 对弈模式：game over 音效是否已播放（防止每帧重复）
         self._idle_played_key = None  # 已播放过 idle 的回合标识
         self._resume_from_replay = False
         self._ai_learned = False      # 本局 AI 是否已完成学习记录（只记一次）
@@ -492,6 +493,7 @@ class Game:
         self._ai_think_timer = 0
         self._ai_think_target = 0
         self._ai_debug_candidates = []
+        self._ai_game_over_sfx_played = False  # 每局重置 game over 音效播放标志
         # 创建根节点：红左上，蓝右下
         red_root = Node('RED', 120, 120, strength=1)
         blue_root = Node('BLUE', SCREEN_WIDTH - 120, SCREEN_HEIGHT - 120, strength=1)
@@ -830,6 +832,10 @@ class Game:
         if self.state == STATE_GAME_OVER:
             # 客户端不保存回放（服务端已有权威回放）
             if self.network_mode != 'client':
+                # AI 对弈模式：统一在 game over 屏幕播放失败音效（每局仅一次，不论胜负）
+                if self._ai_vs_ai and not self._ai_game_over_sfx_played:
+                    play_sfx('heavy_hit')
+                    self._ai_game_over_sfx_played = True
                 fname = self.replay.save()
                 if fname:
                     add_debug_log(f"Replay saved: {fname}", (-1, -1, -1), 3000)
@@ -2894,13 +2900,12 @@ class Game:
         if removed_ids or weakened:
             play_sfx('shear')
         if winner:
-            if self._ai_vs_ai:
-                # AI 对弈模式：无论哪方获胜统一播放 heavy_hit
-                play_sfx('heavy_hit')
-            elif self.my_team:
-                play_sfx('victory' if self.my_team == winner else 'heavy_hit')
-            else:
-                play_sfx('victory')
+            # AI 对弈模式不在此播放（统一在 game over 屏幕播放）；其余模式照常按胜负播放
+            if not self._ai_vs_ai:
+                if self.my_team:
+                    play_sfx('victory' if self.my_team == winner else 'heavy_hit')
+                else:
+                    play_sfx('victory')
         # 一回合只能创建一个节点，但不自动结束回合
         self.has_created_this_turn = True
 
@@ -3059,10 +3064,8 @@ class Game:
             if removed_ids or weakened:
                 play_sfx('shear')
             if winner:
-                # AI 对弈模式：无论哪方获胜统一播放 heavy_hit
-                if self._ai_vs_ai:
-                    play_sfx('heavy_hit')
-                else:
+                # AI 对弈模式不在此播放（统一在 game over 屏幕播放）；其余模式照常按胜负播放
+                if not self._ai_vs_ai:
                     play_sfx('victory' if self.my_team == winner else 'heavy_hit')
 
             # 不再允许切割后自动降级回收点数（人类不能降价，AI 也应遵守相同规则）
