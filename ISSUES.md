@@ -1,10 +1,25 @@
 # Issue 列表（由 GitHub Actions 自动生成，请勿手动编辑）
 
-> 每次 Issue 变更（打开/编辑/关闭等）自动更新。运行时间：2026-08-11 02:23:59 UTC
+> 每次 Issue 变更（打开/编辑/关闭等）自动更新。运行时间：2026-08-11 02:24:59 UTC
 
 ---
 
-当前 Open Issue 数量：**4**
+当前 Open Issue 数量：**5**
+
+## #26 打开回放页面，删除掉回放文件，在尝试播放的时候会报错FileNotFoundError: [Errno 2] No such file or directory: '/data/data/com.termux/files/home/python-dev/BTB_py/replays/20260811_101812.bpr'
+
+| 字段 | 值 |
+| --- | --- |
+| 状态 | OPEN |
+| 作者 | huxinchi |
+| 创建时间 | 2026-08-11T02:24:53Z |
+| 标签 |  |
+
+### 内容
+
+
+
+---
 
 ## #25 攻击显示只能显示一个
 
