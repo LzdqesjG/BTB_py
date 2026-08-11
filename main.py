@@ -868,9 +868,11 @@ class Game:
             self.go_menu()
             return
 
-        # 己方回合开始时播放 idle 音效
+        # 己方回合开始时播放 idle 音效（双 AI 对弈不播放）
         is_my = (self.network_mode is None or self.current_team == self.my_team)
         if self._ai_mode and self.current_team == self._ai_team:
+            is_my = False
+        if self._ai_vs_ai:
             is_my = False
         if is_my:
             key = (self.current_team, self.turn_count)
