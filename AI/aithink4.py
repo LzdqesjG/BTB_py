@@ -329,6 +329,8 @@ class AIThinker:
         self.sit = None
         self._rng = random.Random(20240810)
         self.mem = self._memory()
+        # 候选可视化数据: [(parent, x, y, strength, range_index, score), ...]
+        self.last_cands = []
 
     # ---------- 记忆 ----------
     def _memory(self):
@@ -763,6 +765,7 @@ class AIThinker:
                 if ri > my_score:
                     continue
                 if _seg_hits_circle(n.x, n.y, tx, ty, en_root.x, en_root.y, NODE_RADIUS):
+                    self.last_cands = [(n, tx, ty, MIN_STRENGTH, ri, 99999.0)]
                     return {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
                             'strength': MIN_STRENGTH, 'range_index': ri}
         return None
@@ -1483,6 +1486,10 @@ class AIThinker:
             all_cands.sort(key=lambda c: -c[0])
 
         best = all_cands[0]
+        # 收集 top 候选用于可视化 (含威胁惩罚/模拟后的最终分数)
+        self.last_cands = []
+        for sc, n, t, str_, ri in all_cands[:12]:
+            self.last_cands.append((n, t[0], t[1], str_, ri, sc))
         self.mem['last_target'] = (best[2][0], best[2][1])
         self._remember_placement(best[2][0], best[2][1])
         self.mem['last_placed_en'] = self.sit.en_nodes
@@ -1539,6 +1546,8 @@ class AIThinker:
                     best = {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
                             'strength': MIN_STRENGTH, 'range_index': ri}
         if best is not None:
+            self.last_cands = [(best['parent'], best['x'], best['y'],
+                                best['strength'], best['range_index'], best_score)]
             self._remember_placement(best['x'], best['y'])
             self.mem['last_placed_en'] = self.sit.en_nodes
         return best
@@ -1580,6 +1589,9 @@ class AIThinker:
                     best_score = score
                     best = {'type': 'place_node', 'parent': n, 'x': tx, 'y': ty,
                             'strength': MIN_STRENGTH, 'range_index': 0}
+        if best is not None:
+            self.last_cands = [(best['parent'], best['x'], best['y'],
+                                best['strength'], best['range_index'], best_score)]
         return best
 
     # ============================================================

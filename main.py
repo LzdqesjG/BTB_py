@@ -403,6 +403,10 @@ class Game:
         self._ai_post_reinforce = 0   # 本回合放置后已强化的次数
         self._idle_played_key = None  # 已播放过 idle 的回合标识
         self._resume_from_replay = False
+        # AI 选点动态可视化
+        self._ai_pending_action = None   # 已决策待执行的 AI 动作（先播动画）
+        self._ai_anim_timer = 0          # 动画计时
+        self._AI_ANIM_FRAMES = 40        # 候选动画帧数 (~0.67s)
 
         # 回放记录器
         self.replay = ReplayRecorder()
@@ -417,6 +421,9 @@ class Game:
 
         # 自动吸附到当前范围边界（B 键开关）
         self._snap_enabled = False
+
+        # 回放进度条拖动状态
+        self._replay_progress_dragging = False
 
     def reset(self, game_info=None):
         Node._next_id = 0
@@ -1154,6 +1161,7 @@ class Game:
         weakened = preview['weakened']
 
         # 1. 被切断的对方树枝（虚线高亮）
+        dash_draw = getattr(self, '_draw_dashed_line', None)
         for child in preview['hit_branches']:
             parent = child.parent
             if parent is None:
@@ -1166,8 +1174,13 @@ class Game:
                 w = 2
             else:
                 continue
-            self._draw_dashed_line(surface, (parent.x, parent.y),
-                                   (child.x, child.y), col, dash_len=6, gap_len=4, width=w)
+            if dash_draw is not None:
+                dash_draw(surface, (parent.x, parent.y),
+                          (child.x, child.y), col, dash_len=6, gap_len=4, width=w)
+            else:
+                # 防御：万一 _draw_dashed_line 不存在，退化为实线，避免崩溃
+                pygame.draw.line(surface, col[:3], (int(parent.x), int(parent.y)),
+                                 (int(child.x), int(child.y)), w)
 
         # 2. 被削弱的节点：橙色光圈
         for nid in weakened:
@@ -1198,11 +1211,111 @@ class Game:
                                             NODE_RADIUS + 10, 4)
                     break
 
+    # ===== 攻击范围标记 =====
+
+    def _attack_range_index(self, fx, fy, ex, ey, nodes):
+        """计算从 (fx,fy) 放置新节点，树枝恰好能穿过 (ex,ey) 所需的最小范围档位。
+
+        0 = 默认范围(120)即可直达(直接攻击到)，3 = 需要最大范围(240)。
+        返回 None 表示最大范围也够不到，或落点无法放置。
+        同时校验攻击落点可行性：
+        - 落点须在敌人节点后方（避免与敌人过近而无法放置）
+        - 落点须在屏幕内、且不与任何已有节点过近
+        """
+        d = math.hypot(ex - fx, ey - fy)
+        if d < 1e-6:
+            return None
+        ux = (ex - fx) / d
+        uy = (ey - fy) / d
+        spacing = NODE_RADIUS * 2 + 4  # 与已有节点的最小间距 (~40px)
+        # 攻击落点：敌人节点后方若干间距处（树枝从 fx,fy 穿过 ex,ey）
+        for extra in (spacing + 2, spacing + 16, spacing + 30, spacing + 44):
+            dist_land = d + extra
+            ri = None
+            for i, r in enumerate(RANGE_OPTIONS):
+                if dist_land <= r:
+                    ri = i
+                    break
+            if ri is None:
+                continue
+            tx = ex + ux * extra
+            ty = ey + uy * extra
+            # 落点须在屏幕内（避开顶部 HUD 与四周边缘）
+            if tx < NODE_RADIUS or tx > SCREEN_WIDTH - NODE_RADIUS:
+                continue
+            if ty < 85 or ty > SCREEN_HEIGHT - NODE_RADIUS:
+                continue
+            # 落点不与任何已有节点过近（否则无法放置）
+            ok = True
+            for other in nodes:
+                dx = other.x - tx
+                dy = other.y - ty
+                if dx * dx + dy * dy < spacing * spacing:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            return ri
+        return None
+
+    def _compute_attack_marks(self, team):
+        """计算己方可攻击到敌人的节点，以及每个可被攻击的敌人所需的最小范围档位。
+
+        返回 (attackers, enemy_marks, unaffordable)
+            attackers:    己方可以攻击到至少一个敌人的节点 id 集合
+            enemy_marks:  敌人节点 id → 所需最小范围档位(0~3)
+            unaffordable: 攻击方当前点数不足以支付该档位消耗的敌人节点 id 集合
+        """
+        attackers = set()
+        enemy_marks = {}
+        unaffordable = set()
+        my_nodes = [n for n in self.nodes if n.team == team and n.can_have_child()]
+        enemy_nodes = [n for n in self.nodes if n.team != team]
+        my_points = self.points[team]
+        for m in my_nodes:
+            best = None
+            for e in enemy_nodes:
+                ri = self._attack_range_index(m.x, m.y, e.x, e.y, self.nodes)
+                if ri is None:
+                    continue
+                if e.id not in enemy_marks or ri < enemy_marks[e.id]:
+                    enemy_marks[e.id] = ri
+                if best is None or ri < best:
+                    best = ri
+            if best is not None:
+                attackers.add(m.id)
+        # 问题4: 攻击方当前点数不足以支付该档位的范围消耗 → 标记为"点数不足"
+        for eid, ri in enemy_marks.items():
+            if my_points < ri:
+                unaffordable.add(eid)
+        return attackers, enemy_marks, unaffordable
+
+    def _draw_attack_marks(self, surface, team):
+        """绘制攻击范围标记：
+        - 己方可攻击的节点：外侧一个 ATTACK_MARK_COLOR 圆环
+        - 可被攻击的敌人节点：数字显示所需最小范围档位(0~3)
+        - 攻击方点数不足以支付该档位时数字用红色显示
+        """
+        attackers, enemy_marks, unaffordable = self._compute_attack_marks(team)
+        # 己方可攻击节点：圆环标记
+        for n in self.nodes:
+            if n.team == team and n.id in attackers:
+                _draw_aa_circle_outline(surface, ATTACK_MARK_COLOR,
+                                        (int(n.x), int(n.y)), NODE_RADIUS + 10, 2)
+        # 敌人节点：数字
+        for n in self.nodes:
+            if n.team != team and n.id in enemy_marks:
+                num = enemy_marks[n.id]
+                color = (255, 110, 110) if n.id in unaffordable else ATTACK_MARK_COLOR
+                txt = font_tiny.render(str(num), True, color)
+                surface.blit(txt, txt.get_rect(center=(int(n.x), int(n.y) - NODE_RADIUS - 10)))
+
     @staticmethod
     def _point_in_range(px, py, node, radius):
+        """判断点是否在节点 radius 范围内（含浮点容差，吸附到边界时也能判定成功）。"""
         dx = px - node.x
         dy = py - node.y
-        return dx * dx + dy * dy <= radius * radius
+        return dx * dx + dy * dy <= radius * radius + 1e-6
 
     @staticmethod
     def _point_to_segment_dist(px, py, x1, y1, x2, y2):
@@ -1501,6 +1614,11 @@ class Game:
                           and not self.has_created_this_turn)
             node.draw(surface, emphasized=emphasized)
 
+        # 攻击范围标记（己方可攻击的节点 + 敌人节点所需范围档位数字）
+        # 拖动中不显示（让位给放置预览）；完成放置后仍显示，辅助判断是否需要升级
+        if not self.dragging:
+            self._draw_attack_marks(surface, self.current_team)
+
         # 切割预览（在节点上方绘制，避免被遮挡）
         if preview is not None:
             self._draw_cut_preview(surface, preview)
@@ -1509,31 +1627,9 @@ class Game:
         for popup in self.score_popups:
             popup.draw(surface)
 
-        # ===== AI 候选可视化（已注释） =====
-        # if self._ai_debug_candidates:
-        #     max_score = max(s for _, s in self._ai_debug_candidates)
-        #     max_score = max(max_score, 1.0)  # 避免除零
-        #     for action, score in self._ai_debug_candidates:
-        #         parent = action['parent']
-        #         x, y = action['x'], action['y']
-        #         strength = action['strength']
-        #         alpha = int(80 + 100 * (score / max_score))  # 80~180 透明度
-        #         # 连线：半透明虚线
-        #         self._draw_dashed_line(surface, (parent.x, parent.y), (x, y),
-        #                                (255, 255, 120, alpha), dash_len=8, gap_len=6, width=1)
-        #         # 候选节点小圆
-        #         r = NODE_RADIUS * 0.5 + strength * 0.5
-        #         color = TEAM_COLORS[self.current_team]['main']
-        #         # 外圈
-        #         pygame.draw.circle(surface, (*color[:3], alpha),
-        #                            (int(x), int(y)), int(r), 1)
-        #         # 填充
-        #         pygame.draw.circle(surface, (*color[:3], alpha // 3),
-        #                            (int(x), int(y)), int(r - 1))
-        #         # 评分数字
-        #         s_txt = font_tiny.render(str(int(score)), True,
-        #                                  (255, 255, 180, alpha))
-        #         surface.blit(s_txt, s_txt.get_rect(center=(x, y - r - 8)))
+        # ===== AI 候选可视化（动态） =====
+        if self._ai_debug_candidates:
+            self._draw_ai_candidates(surface)
 
         # ===== HUD 顶部信息 =====
         # 红方信息
@@ -2219,7 +2315,21 @@ class Game:
             self._broadcast_state_changed()
 
     def _ai_update(self):
-        """AI 回合自动操作。每帧调用，延迟后执行 AI 动作。"""
+        """AI 回合自动操作。每帧调用。
+
+        决策后先播放选点动画（候选点渐显、最优解高亮），
+        动画结束再真正执行动作。
+        """
+        # 有待执行的动作：播放选点动画
+        if self._ai_pending_action is not None:
+            self._ai_anim_timer += 1
+            if self._ai_anim_timer >= self._AI_ANIM_FRAMES:
+                action = self._ai_pending_action
+                self._ai_pending_action = None
+                self._ai_anim_timer = 0
+                self._execute_ai_action(action)
+            return
+
         if self._ai_think_timer < self._AI_THINK_DELAY:
             self._ai_think_timer += 1
             return
@@ -2256,6 +2366,17 @@ class Game:
         if action is None:
             return
 
+        # 收集候选可视化数据（parent, x, y, strength, range_index, score）
+        self._ai_debug_candidates = list(getattr(ai, 'last_cands', []))
+
+        # 暂存动作，先播放选点动画
+        self._ai_pending_action = action
+        self._ai_anim_timer = 0
+
+    def _execute_ai_action(self, action):
+        """执行 AI 决策的动作（选点动画结束后调用）。"""
+        # 动作已执行，清除候选可视化数据，避免残留
+        self._ai_debug_candidates = []
         if action['type'] == 'end_turn':
             self._end_turn()
         elif action['type'] == 'place_node':
@@ -2303,36 +2424,7 @@ class Game:
             if winner:
                 play_sfx('victory' if self.my_team == winner else 'heavy_hit')
 
-            # 切割后自动降级：回收点数
-            if (not winner and strength >= 3
-                    and (removed_ids or weakened)):
-                own_root = None
-                for n in self.nodes:
-                    if n.team == self.current_team and n.parent is None:
-                        own_root = n
-                        break
-                is_defensive = (
-                    own_root
-                    and math.hypot(new_node.x - own_root.x,
-                                   new_node.y - own_root.y) <= 240)
-                target_strength = 2 if is_defensive else 1
-                if new_node.strength > target_strength:
-                    levels_down = new_node.strength - target_strength
-                    old_str = new_node.strength
-                    new_node.strength = target_strength
-                    self.points[self.current_team] += levels_down
-                    self.replay.record(
-                        'modify_branch', team=self.current_team,
-                        node_id=new_node.id,
-                        old_strength=old_str,
-                        new_strength=target_strength)
-                    if self.network_mode == 'host':
-                        import network_protocol as proto
-                        self._broadcast(proto.ACT_UPDATE_STRENGTH,
-                                        new_node.id, new_node.strength)
-                        self._broadcast_state_changed()
-                    play_sfx('tap', strength=target_strength)
-
+            # 不再允许切割后自动降级回收点数（人类不能降价，AI 也应遵守相同规则）
             self.has_created_this_turn = True
         elif action['type'] == 'modify_branch':
             node = action['node']
@@ -2351,6 +2443,55 @@ class Game:
                     self._broadcast(proto.ACT_UPDATE_STRENGTH, node.id, node.strength)
                     self._broadcast_state_changed()
                 play_sfx('tap', strength=new_str)
+
+    def _draw_ai_candidates(self, surface):
+        """动态绘制 AI 选点候选：评分越高越先亮起，最优解金色脉冲高亮。
+
+        候选数据格式: [(parent, x, y, strength, range_index, score), ...]
+        """
+        cands = self._ai_debug_candidates
+        if not cands:
+            return
+        now = pygame.time.get_ticks()
+        # 动画进度 0~1
+        anim_t = min(1.0, self._ai_anim_timer / max(1, self._AI_ANIM_FRAMES))
+
+        # 按评分从高到低排序
+        cands_sorted = sorted(cands, key=lambda c: -c[5])
+        max_score = max(c[5] for c in cands_sorted) or 1.0
+
+        for i, (parent, x, y, strength, ri, score) in enumerate(cands_sorted):
+            # 每个候选按其排名在动画中依次亮起
+            appear = i / max(1, len(cands_sorted))
+            local_t = (anim_t - appear * 0.7) * 3.0  # 放大渐显速度
+            if local_t <= 0:
+                continue
+            local_t = min(1.0, local_t)
+            alpha = int(70 + 150 * local_t * (0.4 + 0.6 * (score / max_score)))
+            alpha = max(30, min(220, alpha))
+            color = TEAM_COLORS[self.current_team]['main']
+
+            # 候选连线：半透明虚线
+            self._draw_dashed_line(surface, (parent.x, parent.y), (x, y),
+                                   (255, 255, 120, alpha), dash_len=8, gap_len=6, width=1)
+            # 候选节点小圆
+            r = int(NODE_RADIUS * 0.5 + strength * 0.5)
+            pygame.draw.circle(surface, (*color[:3], alpha), (int(x), int(y)), r, 1)
+            pygame.draw.circle(surface, (*color[:3], alpha // 3), (int(x), int(y)), r - 1)
+            # 评分数字
+            s_txt = font_tiny.render(str(int(score)), True, (255, 255, 180, alpha))
+            surface.blit(s_txt, s_txt.get_rect(center=(x, y - r - 8)))
+
+        # 最优解：金色脉冲光环
+        best_parent, bx, by, bstr, bri, bscore = cands_sorted[0]
+        pulse = 1.0 + 0.12 * math.sin(now * 0.012)
+        ring_r = int((NODE_RADIUS + 8) * pulse)
+        _draw_aa_circle_outline(surface, (255, 215, 0, 220),
+                                (int(bx), int(by)), ring_r, 3)
+        # 最优解实线
+        pygame.draw.line(surface, (255, 215, 0),
+                         (int(best_parent.x), int(best_parent.y)),
+                         (int(bx), int(by)), 2)
 
     def _end_turn(self):
         # 客户端模式：发送结束回合请求给服务器
@@ -2697,11 +2838,26 @@ class Game:
             self._last_replay_click_time = 0
 
     def _do_replay_delete(self):
-        """删除当前选中的回放文件（移入 deleted 目录）。"""
+        """删除当前选中的回放文件（移入 deleted 目录）。
+
+        防御性处理：空列表 / 文件在磁盘上已不存在 / 索引越界时都不会崩溃。
+        """
         if not self._replay_files:
             return
+        if not (0 <= self._replay_selected < len(self._replay_files)):
+            self._replay_selected = 0
+            if not self._replay_files:
+                return
         fname = self._replay_files[self._replay_selected][0]
         src = os.path.join(os.path.dirname(__file__), 'replays', fname)
+        if not os.path.isfile(src):
+            # 文件在磁盘上已不存在：仅从列表移除，不执行移动
+            del self._replay_files[self._replay_selected]
+            play_sfx('shear')
+            if self._replay_files:
+                self._replay_selected = min(self._replay_selected,
+                                            len(self._replay_files) - 1)
+            return
         del_dir = os.path.join(os.path.dirname(__file__), 'replays', 'deleted')
         os.makedirs(del_dir, exist_ok=True)
         dst = os.path.join(del_dir, fname)
@@ -2709,7 +2865,8 @@ class Game:
         del self._replay_files[self._replay_selected]
         play_sfx('shear')
         if self._replay_files:
-            self._replay_selected = min(self._replay_selected, len(self._replay_files) - 1)
+            self._replay_selected = min(self._replay_selected,
+                                        len(self._replay_files) - 1)
 
     def _start_replay(self, filename):
         """加载回放文件，分组为步骤，构建初始棋盘。"""
@@ -2732,6 +2889,7 @@ class Game:
         self._replay_step_index = -1
         self._replay_playing = False
         self._replay_timer = 0
+        self._replay_progress_dragging = False
 
         # 构建初始状态（只有根节点，无任何操作）
         Node._next_id = 100000
@@ -2839,6 +2997,27 @@ class Game:
     def _is_replay_first_step(self):
         return self._replay_step_index < 0
 
+    def _replay_seek(self, ratio):
+        """拖动进度条：按比例 (0.0~1.0) 跳到对应步骤，并重建局面。"""
+        total = len(self._replay_steps)
+        if total <= 0:
+            return
+        # 进度条 0 → 初始步骤(-1)，1 → 最后一步(len-1)
+        target = max(-1, min(total - 1, int(round(ratio * total)) - 1))
+        if target == self._replay_step_index:
+            return
+        self._replay_step_index = target
+        self._rebuild_replay_state()
+
+    def _replay_seek_from_x(self, mx):
+        """把鼠标 x 坐标映射为进度条比例并跳转。"""
+        rect = getattr(self, '_replay_progress_rect', None)
+        if rect is None or rect.width <= 0:
+            return
+        ratio = (mx - rect.x) / rect.width
+        ratio = max(0.0, min(1.0, ratio))
+        self._replay_seek(ratio)
+
     def draw_replay_play(self, surface):
         """回放播放界面。"""
         surface.fill(BG_COLOR)
@@ -2928,12 +3107,37 @@ class Game:
                                             can_enter,
                                             (160, 120, 20))
 
-        # 胜利提示（按钮下方，避免遮挡）
+        # 可拖动进度条（顶部居中，位于控制按钮下方）
+        bar_w, bar_h = 700, 10
+        bar_x = (SCREEN_WIDTH - bar_w) // 2
+        bar_y = btn_y + btn_h + 16
+        if total_steps > 0:
+            progress = (self._replay_step_index + 1) / total_steps
+        else:
+            progress = 0.0
+        progress = max(0.0, min(1.0, progress))
+        self._replay_progress_rect = pygame.Rect(bar_x, bar_y, bar_w, bar_h)
+        # 轨道
+        pygame.draw.rect(surface, (60, 60, 80), self._replay_progress_rect, border_radius=5)
+        pygame.draw.rect(surface, WHITE, self._replay_progress_rect, 1, border_radius=5)
+        # 已播放部分
+        fill_w = int(bar_w * progress)
+        if fill_w > 0:
+            pygame.draw.rect(surface, (90, 150, 230), (bar_x, bar_y, fill_w, bar_h),
+                             border_radius=5)
+        # 滑块圆点
+        handle_x = bar_x + fill_w
+        pygame.draw.circle(surface, (200, 225, 255), (handle_x, bar_y + bar_h // 2), 8)
+        # 拖动时高亮滑块
+        if self._replay_progress_dragging:
+            pygame.draw.circle(surface, (255, 230, 150), (handle_x, bar_y + bar_h // 2), 10, 2)
+
+        # 胜利提示（进度条下方，避免遮挡）
         if self.winner:
             wcolor = TEAM_COLORS[self.winner]['main']
             winner_name = self._team_label(self.winner)
             wtxt = font_mid.render(f"{winner_name} 获胜", True, wcolor)
-            surface.blit(wtxt, wtxt.get_rect(center=(SCREEN_WIDTH // 2, btn_y + btn_h + 18)))
+            surface.blit(wtxt, wtxt.get_rect(center=(SCREEN_WIDTH // 2, bar_y + bar_h + 18)))
 
         # 返回按钮
         back_rect = pygame.Rect(SCREEN_WIDTH - 120, SCREEN_HEIGHT - 50, 100, 34)
@@ -2996,6 +3200,15 @@ class Game:
             sys.exit()
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mp = event.pos
+            # 点击/按下进度条：暂停自动播放并开始拖动跳转
+            if (not getattr(self, '_resume_menu', False)
+                    and hasattr(self, '_replay_progress_rect')
+                    and self._replay_progress_rect.inflate(0, 12).collidepoint(mp)):
+                self._replay_progress_dragging = True
+                self._replay_playing = False
+                self._replay_timer = 0
+                self._replay_seek_from_x(mp[0])
+                return
             if hasattr(self, '_replay_back_rect') and self._replay_back_rect.collidepoint(mp):
                 play_sfx('click')
                 self.go_menu()
@@ -3017,6 +3230,12 @@ class Game:
                     self._resume_menu = True
                     self._resume_buttons = []
                     self._resume_rects = {}
+        # 拖动进度条：跟随鼠标移动跳转
+        if event.type == pygame.MOUSEMOTION and self._replay_progress_dragging:
+            self._replay_seek_from_x(event.pos[0])
+        # 松开鼠标结束拖动
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._replay_progress_dragging = False
         # 残局模式子菜单
         if getattr(self, '_resume_menu', False) and event.type == pygame.MOUSEBUTTONDOWN:
             mp = pygame.mouse.get_pos()
