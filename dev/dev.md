@@ -24,6 +24,7 @@
   - [AI/aithink4.py - AI 系统](#aiaithink4py---ai-系统)
   - [AI 自动学习](#ai-自动学习17)
   - [AI 托管](#ai-托管30)
+  - [AI 对弈模式（双 AI 训练）](#ai-对弈模式双-ai-训练)
   - [replay.py - 回放系统](#replaypy---回放系统)
 - [联机架构](#联机架构)
   - [网络拓扑](#网络拓扑)
@@ -431,6 +432,7 @@ while True:
 **AI 增强特性**：
 - **放置后强化**：AI 放置节点后调用 `choose_reinforce()` 优先加固威胁走廊内的低强度边，每回合最多 2 次（由 `Game._ai_post_reinforce` 控制，见 `main.py _ai_update()`）
 - **记忆**：上次落点被摧毁的位置不再重建（`_ai_memory`，每局 `reset()` 时清空）
+- **重复路线破局**（剪树枝死循环修复）：`best_placement` 里对比本次与上次操作——同一父节点且目标点距离 <60px 视为"极度相似"，`mem['similar_turns']` 连续 +1，路线变化则重置。连续 ≥3 回合重复同一操作时，`score_target` 对靠近上次落点 120px 内的候选按 (120-d)*4 重罚、并按距离×0.25 偏好远处新路线，强制 AI 换一条路线，打破"反复剪同一区域树枝"的僵局
 - **前向模拟**：对候选做 2 层贪心推演修正静态分
 - **思考延迟**：由 `config.json` 的 `ai.think_delay_frames` 控制（默认 90 帧 ≈ 1.5s），`main.py` 中 `_AI_THINK_DELAY = AI_THINK_DELAY`
 
@@ -491,6 +493,18 @@ python dev/rl_evolve.py --games 8 --mutation 0.12 --seed 42
 - `_ai_update()` 创建 `AIThinker` 后立即 `ai.team = self.current_team` / `ai.enemy_team = ...`（按**当前回合队伍**，而非固定的 `_ai_team`）—— 否则托管玩家队时 `decide_action()` 会把己方行动当成对手行动，回合卡死
 - `Game._ai_memory_by_team`：托管双 AI 时按队伍隔离记忆，避免两个 AI 互相污染
 - `is_my_turn`：托管期间玩家队回合判定为 False，阻止人类输入干扰 AI 操作
+
+### AI 对弈模式（双 AI 训练）
+
+主菜单【AI 对弈】按钮（设置按钮左侧）进入 **红蓝双 AI 自动对局**，用于批量生成训练数据：
+
+- 双方都交给 AI（`_ai_vs_ai=True`，`_ai_team=None`，`my_team=None`），玩家**不可操作**、**不可托管**、**不可手动结束回合**（结束回合/托管按钮隐藏，Tab/点击全部忽略）
+- **思考帧数 0、无选点动画**（`_AI_THINK_DELAY=0`、`_AI_ANIM_FRAMES=0`），结束回合零延迟，纯快进
+- 一方获胜 → 自动保存回放并**自动重开下一局**，同时从红方视角记录学习数据（`_record_ai_learn('RED')` → 写入 `AI/learn.json`，连败/连胜达阈值时微调 `AI/ai.json` 权重）
+- 回放保存到 `replays/ai_vs_ai/`（`ReplayRecorder` 新增 `subdir` 参数）；回放选择界面递归扫描 `replays/`，子目录回放同样可看可删
+- 权重写盘优化：`record_match_result` 仅当权重**实际变化**时才备份+写回 `ai.json`（`adjusted` 标志），对弈连刷不会在 `AI/backup/` 堆积文件；learn.json 每局照常记录
+- AI 权重：每次 `reset()` 开局重新调用 `_reload_override()` 加载 `AI/ai.json`，对弈模式自动重开时每局都会拿到最新权重
+- 从对弈模式返回菜单时恢复默认思考延迟/动画（`go_menu` 重置）
 
 ### replay.py - 回放系统
 

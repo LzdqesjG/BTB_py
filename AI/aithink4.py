@@ -564,6 +564,7 @@ class AIThinker:
 
         # ---- 依据最近连败/连胜微调权重 (平局只统计不调整) ----
         cfg = self.cfg
+        adjusted = False  # 权重是否实际变化（决定是否备份+写盘）
         if result in ('win', 'loss'):
             win = (result == 'win')
             streak = 0
@@ -579,20 +580,24 @@ class AIThinker:
                 cfg.threat_mul *= 1.03          # 提升威胁感知
                 cfg.collect_low *= 1.05         # 更积极收集保点数
                 learn['last_adjust'] = 'conservative'
+                adjusted = True
             elif win and streak >= 3:
                 cfg.risk_taker *= 1.03          # 小幅恢复冒险
                 cfg.spend_mid *= 1.02
                 cfg.threat_mul *= 0.99
                 learn['last_adjust'] = 'aggressive'
+                adjusted = True
 
         # ---- 对手行为应对：对手爱强化 → 提高威胁感知 ----
         if os_ and os_.get('total'):
             reinf = os_['strong'] / os_['total']
             if reinf > 0.5:
                 cfg.threat_mul = min(3.0, cfg.threat_mul * 1.02)
+                adjusted = True
 
         cfg._apply_clip()
-        save_weights(cfg)
+        if adjusted:
+            save_weights(cfg)  # 权重有变化才备份并写回 ai.json（对弈连刷也不会堆积备份）
         _save_learn(learn)
         return learn
 
@@ -1140,6 +1145,15 @@ class AIThinker:
         last = self.mem.get('last_target')
         if last:
             s += _dist(tx, ty, last[0], last[1]) * 0.02
+
+        # ---- 重复路线破局: 连续 ≥3 回合操作与上次极度相似 → 避开原路线区域, 强制换路线 ----
+        # 修复: AI 双方永远重复同一操作 (如反复剪同一区域的树枝) → 谁也推进不了。
+        # 检测到"原地踏步"后, 对靠近上次落点区域的候选重罚, 并偏好更远的新路线。
+        if self.mem.get('similar_turns', 0) >= 3 and last:
+            d_lt = _dist(tx, ty, last[0], last[1])
+            if d_lt < 120:
+                s -= (120 - d_lt) * 4.0   # 重复区域附近重罚
+            s += d_lt * 0.25               # 离重复区越远越优先 (鼓励换线)
 
         # 绕后补防: 缺口扇区方向建防线
         if sit.flank_threat and sit.flank_gap_angle >= 0:
@@ -1713,11 +1727,20 @@ class AIThinker:
             all_cands.sort(key=lambda c: -c[0])
 
         best = all_cands[0]
+        # 换路线检测: 与上次操作"极度相似"(同一父节点 + 目标点高度重合) → 重复计数+1
+        prev_t = self.mem.get('last_target')
+        prev_p = self.mem.get('last_parent_id')
+        same_parent = (prev_p is not None and best[1].id == prev_p)
+        if prev_t is not None and same_parent and _dist(best[2][0], best[2][1], prev_t[0], prev_t[1]) < 60.0:
+            self.mem['similar_turns'] = self.mem.get('similar_turns', 0) + 1
+        else:
+            self.mem['similar_turns'] = 1  # 路线变化则重置
+        self.mem['last_target'] = (best[2][0], best[2][1])
+        self.mem['last_parent_id'] = best[1].id
         # 收集 top 候选用于可视化 (含威胁惩罚/模拟后的最终分数)
         self.last_cands = []
         for sc, n, t, str_, ri in all_cands[:12]:
             self.last_cands.append((n, t[0], t[1], str_, ri, sc))
-        self.mem['last_target'] = (best[2][0], best[2][1])
         self._remember_placement(best[2][0], best[2][1])
         self.mem['last_placed_en'] = self.sit.en_nodes
         self.mem['stall_turns'] = 0

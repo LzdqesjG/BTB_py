@@ -25,9 +25,10 @@ class ReplayRecorder:
       {"type":"game_over", "winner":"RED"}
     """
 
-    def __init__(self):
+    def __init__(self, subdir=''):
         self.actions = []
         self._saved = False
+        self.subdir = subdir  # 子目录（如 ai_vs_ai），相对 replays/ 根目录
 
     def record(self, action_type, **kwargs):
         """记录一个操作。"""
@@ -38,7 +39,7 @@ class ReplayRecorder:
     @property
     def filepath(self):
         """生成回放文件路径。"""
-        replay_dir = os.path.join(os.path.dirname(__file__), 'replays')
+        replay_dir = os.path.join(os.path.dirname(__file__), 'replays', self.subdir)
         os.makedirs(replay_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         return os.path.join(replay_dir, f"{ts}.bpr")

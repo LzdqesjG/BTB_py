@@ -411,6 +411,7 @@ class Game:
         self._ai_memory = {}          # AI 跨回合记忆
         self._ai_memory_by_team = {'RED': {}, 'BLUE': {}}  # 托管双 AI 时按队伍隔离记忆
         self._ai_custody = False      # 玩家队伍是否交给 AI 托管（仅 AI 对战模式可用）
+        self._ai_vs_ai = False        # AI 对弈模式：双 AI 自动对局（纯训练数据）
         self._ai_post_reinforce = 0   # 本回合放置后已强化的次数
         self._idle_played_key = None  # 已播放过 idle 的回合标识
         self._resume_from_replay = False
@@ -440,6 +441,12 @@ class Game:
 
     def reset(self, game_info=None):
         Node._next_id = 0
+        # 每次开局重新加载 AI 权重（ai.json 可能已被自动学习/外部修改）
+        try:
+            from AI.aithink4 import _reload_override
+            _reload_override()
+        except Exception:
+            pass
         self.nodes = []
         self.points = {'RED': INITIAL_POINTS, 'BLUE': INITIAL_POINTS}
         self.current_team = 'RED'
@@ -468,7 +475,7 @@ class Game:
         self._init_pickups()
 
         # 回放：记录对局信息（首行），然后是初始状态
-        self.replay = ReplayRecorder()
+        self.replay = ReplayRecorder(subdir='ai_vs_ai' if self._ai_vs_ai else '')
         if game_info:
             self.replay.record('game_info', **game_info)
         self.replay.record('init',
@@ -477,12 +484,14 @@ class Game:
             self.replay.record('spawn_pack', x=p.x, y=p.y, value=p.value)
 
     def start_game(self):
+        self._ai_vs_ai = False
         self.reset(game_info={'mode': 'single'})
         self.state = STATE_PLAYING
 
     def start_host_game(self):
         """房主开始游戏（红队）。"""
         import network_protocol as proto
+        self._ai_vs_ai = False
         self.network_mode = 'host'
         self.my_team = 'RED'
         self.reset(game_info={'mode': 'network', 'role': 'host', 'team': 'RED'})
@@ -493,12 +502,14 @@ class Game:
 
     def start_client_game(self):
         """客户端进入等待房主开始的状态。"""
+        self._ai_vs_ai = False
         self.network_mode = 'client'
         self.my_team = 'BLUE'
         self.state = STATE_CLIENT_WAIT
 
     def start_ai_game(self):
         """AI对战模式：随机分配队伍，本地对局。"""
+        self._ai_vs_ai = False
         self._ai_mode = True
         self._ai_team = random.choice(['RED', 'BLUE'])
         self.my_team = 'RED' if self._ai_team == 'BLUE' else 'BLUE'
@@ -510,6 +521,24 @@ class Game:
             'player_team': self.my_team,
             'ai_team': self._ai_team,
         })
+        self.state = STATE_PLAYING
+
+    def start_ai_vs_ai_game(self):
+        """AI 对弈模式：红蓝双 AI 自动对局，纯刷训练数据。
+
+        - 双方都交给 AI，玩家不可操作、不可托管、不可手动结束回合；
+        - 思考帧数 0、无选点动画（结束回合零延迟）；
+        - 一方获胜自动保存回放并重开下一局（replays/ai_vs_ai/）。
+        """
+        self._ai_vs_ai = True
+        self._ai_mode = True
+        self._ai_team = None        # 不锁定单队：当前回合队伍即 AI 队伍
+        self.my_team = None
+        self.network_mode = None
+        self._ai_think_timer = 0
+        self._AI_THINK_DELAY = 0    # 思考 0 帧，立即决策
+        self._AI_ANIM_FRAMES = 0    # 无动画延迟，结束回合立即切换
+        self.reset(game_info={'mode': 'ai_vs_ai'})
         self.state = STATE_PLAYING
 
     def go_menu(self):
@@ -531,17 +560,25 @@ class Game:
         self.my_team = None
         self._ai_mode = False
         self._ai_team = None
+        self._ai_vs_ai = False
+        self._AI_THINK_DELAY = max(1, AI_THINK_DELAY)  # 恢复默认思考延迟
+        self._AI_ANIM_FRAMES = 40                      # 恢复默认选点动画
         self.ip_input = ''
         self.connect_error = None
         self.state = STATE_MENU
 
-    def _record_ai_learn(self):
+    def _record_ai_learn(self, observer_team=None):
         """记录本局 AI 学习数据（对局结果 + 对手打法），微调权重写回 ai.json。
 
         在 go_menu() 返回菜单时调用，一局只记一次。
+        - observer_team: 观察视角队伍。AI 对弈模式传 'RED'，统一从红方视角记录；
+          默认 None 表示用 AIThinker 默认视角（玩家 vs AI 时即 AI 队视角）。
         """
         from AI.aithink4 import AIThinker
         ai = AIThinker(self)
+        if observer_team:
+            ai.team = observer_team
+            ai.enemy_team = 'BLUE' if observer_team == 'RED' else 'RED'
         ai.observe_opponent(self.nodes)
         if self.winner is None:
             result = 'draw'  # 中途退出，只统计不调整权重
@@ -768,6 +805,13 @@ class Game:
                 fname = self.replay.save()
                 if fname:
                     add_debug_log(f"Replay saved: {fname}", (-1, -1, -1), 3000)
+                # AI 对弈模式：记录学习数据并微调权重，随后自动重开下一局
+                if self._ai_vs_ai:
+                    try:
+                        self._record_ai_learn('RED')
+                    except Exception as e:
+                        print(f"[AI学习] 对弈记录失败: {e}")
+                    self.start_ai_vs_ai_game()
             return
 
         if self.state == STATE_REPLAY_PLAY:
@@ -813,8 +857,9 @@ class Game:
         self._update_hovered_branch()
         self.score_popups = [p for p in self.score_popups if p.is_alive()]
 
-        # AI 回合自动操作：AI 模式的 AI 队，或玩家开启托管后的自己队伍
-        if self._ai_mode and (self.current_team == self._ai_team
+        # AI 回合自动操作：AI 对弈(双AI) / AI 模式的 AI 队 / 玩家开启托管后的自己队伍
+        if self._ai_mode and (self._ai_vs_ai
+                              or self.current_team == self._ai_team
                               or (self._ai_custody and self.current_team == self.my_team)):
             self._ai_update()
 
@@ -1513,20 +1558,28 @@ class Game:
                      font_mid.render("加入房间", True, WHITE).get_rect(center=btn4.center))
         self._btn_join = btn4
 
-        # 回放 / 设置 按钮（第二行）
+        # 回放 / AI对弈 / 设置 按钮（第二行）
         btn2_y = btn_y + btn_h + 12
         btn2_w = 130
-        bx5 = SCREEN_WIDTH // 2 - btn2_w - 8
 
-        # 回放
-        self._btn_replay = pygame.Rect(bx5, btn2_y, btn2_w, btn_h)
+        # 回放（最左）
+        self._btn_replay = pygame.Rect(SCREEN_WIDTH // 2 - btn2_w * 2 - 16, btn2_y, btn2_w, btn_h)
         hr = self._btn_replay.collidepoint(mouse_pos)
         pygame.draw.rect(surface, (60, 140, 160) if hr else (35, 90, 110), self._btn_replay, border_radius=8)
         pygame.draw.rect(surface, WHITE, self._btn_replay, 2, border_radius=8)
         surface.blit(font_mid.render("回放", True, WHITE),
                      font_mid.render("回放", True, WHITE).get_rect(center=self._btn_replay.center))
 
-        # 设置（预留）
+        # AI 对弈（设置按钮左侧）：双 AI 自动对局，纯刷训练数据
+        self._btn_ai_vs_ai = pygame.Rect(SCREEN_WIDTH // 2 - btn2_w - 8, btn2_y, btn2_w, btn_h)
+        ha = self._btn_ai_vs_ai.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, (150, 95, 175) if ha else (95, 58, 115),
+                         self._btn_ai_vs_ai, border_radius=8)
+        pygame.draw.rect(surface, WHITE, self._btn_ai_vs_ai, 2, border_radius=8)
+        surface.blit(font_mid.render("AI 对弈", True, WHITE),
+                     font_mid.render("AI 对弈", True, WHITE).get_rect(center=self._btn_ai_vs_ai.center))
+
+        # 设置
         self._btn_settings = pygame.Rect(SCREEN_WIDTH // 2 + 8, btn2_y, btn2_w, btn_h)
         hs = self._btn_settings.collidepoint(mouse_pos)
         pygame.draw.rect(surface, (100, 100, 100) if hs else (60, 60, 60), self._btn_settings, border_radius=8)
@@ -1753,17 +1806,18 @@ class Game:
                 ts2 = font_tiny.render("  ".join(warn), True, (255, 100, 100))
                 surface.blit(ts2, ts2.get_rect(center=(SCREEN_WIDTH // 2, tip_y + 20)))
 
-        # 结束回合按钮（左下角）
+        # 结束回合按钮（左下角；AI 对弈模式隐藏，由 AI 自动结束）
         mouse_pos = pygame.mouse.get_pos()
-        hover = self.end_turn_rect.collidepoint(mouse_pos)
-        bc = DARK_GRAY if not hover else (80, 80, 120)
-        pygame.draw.rect(surface, bc, self.end_turn_rect, border_radius=6)
-        pygame.draw.rect(surface, WHITE, self.end_turn_rect, 2, border_radius=6)
-        et = font_small.render("结束回合 (Tab)", True, WHITE)
-        surface.blit(et, et.get_rect(center=self.end_turn_rect.center))
+        if not self._ai_vs_ai:
+            hover = self.end_turn_rect.collidepoint(mouse_pos)
+            bc = DARK_GRAY if not hover else (80, 80, 120)
+            pygame.draw.rect(surface, bc, self.end_turn_rect, border_radius=6)
+            pygame.draw.rect(surface, WHITE, self.end_turn_rect, 2, border_radius=6)
+            et = font_small.render("结束回合 (Tab)", True, WHITE)
+            surface.blit(et, et.get_rect(center=self.end_turn_rect.center))
 
-        # AI 托管按钮（左下角，仅 AI 对战模式且配置允许时显示）
-        if 'ai' in AI_CUSTODY_ALLOWED_MODES and self._ai_mode:
+        # AI 托管按钮（左下角，仅 AI 对战模式且配置允许时显示；AI 对弈模式隐藏）
+        if 'ai' in AI_CUSTODY_ALLOWED_MODES and self._ai_mode and not self._ai_vs_ai:
             hover2 = self.ai_custody_rect.collidepoint(mouse_pos)
             bc2 = (70, 90, 70) if self._ai_custody else (DARK_GRAY if not hover2 else (80, 80, 120))
             pygame.draw.rect(surface, bc2, self.ai_custody_rect, border_radius=6)
@@ -1774,7 +1828,10 @@ class Game:
             surface.blit(et2, et2.get_rect(center=self.ai_custody_rect.center))
 
         # 底部提示
-        if self._ai_mode and (self.current_team == self._ai_team
+        if self._ai_vs_ai:
+            hint = font_tiny.render("AI 对弈中...（双 AI 自动对局，一方胜出自动重开并保存回放）",
+                                    True, (180, 140, 60))
+        elif self._ai_mode and (self.current_team == self._ai_team
                               or (self._ai_custody and self.current_team == self.my_team)):
             pct = int(self._ai_think_timer / self._AI_THINK_DELAY * 100)
             progress_label = f"AI 思考中... ({pct}%)" if self._ai_think_timer > 0 else "AI 思考中..."
@@ -1952,6 +2009,9 @@ class Game:
             elif hasattr(self, '_btn_replay') and self._btn_replay.collidepoint(event.pos):
                 play_sfx('click')
                 self._enter_replay_select()
+            elif hasattr(self, '_btn_ai_vs_ai') and self._btn_ai_vs_ai.collidepoint(event.pos):
+                play_sfx('click')
+                self.start_ai_vs_ai_game()
             elif hasattr(self, '_btn_settings') and self._btn_settings.collidepoint(event.pos):
                 play_sfx('click')
                 self._enter_settings()
@@ -2105,28 +2165,33 @@ class Game:
         surface.blit(tip, tip.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 40)))
 
     def _enter_replay_select(self):
-        """进入回放文件选择界面。解析每个回放的步数和胜者。"""
-        replay_dir = os.path.join(os.path.dirname(__file__), 'replays')
-        if os.path.isdir(replay_dir):
-            files = sorted(
-                [f for f in os.listdir(replay_dir) if f.endswith('.bpr')],
-                reverse=True)
-            self._replay_files = []
-            import json
-            for fname in files:
-                steps, winner_label, mode_label = self._parse_replay_meta(fname)
-                self._replay_files.append((fname, steps, winner_label, mode_label))
-        else:
-            self._replay_files = []
+        """进入回放文件选择界面。解析每个回放的步数和胜者。
+
+        递归扫描 replays/ 目录（含 ai_vs_ai 子目录），
+        列表项存储相对 replays/ 的路径。
+        """
+        replay_root = os.path.join(os.path.dirname(__file__), 'replays')
+        rels = []
+        if os.path.isdir(replay_root):
+            for dirpath, _dirnames, filenames in os.walk(replay_root):
+                for f in filenames:
+                    if f.endswith('.bpr'):
+                        rels.append(os.path.relpath(os.path.join(dirpath, f), replay_root))
+            rels.sort(key=lambda rel: os.path.basename(rel), reverse=True)
+        self._replay_files = []
+        import json
+        for rel in rels:
+            steps, winner_label, mode_label = self._parse_replay_meta(rel)
+            self._replay_files.append((rel, steps, winner_label, mode_label))
         self._replay_selected = 0
         self._replay_page = 0
         self._replay_delete_mode = False
         self.state = STATE_REPLAY_SELECT
 
-    def _parse_replay_meta(self, fname):
-        """快速解析回放文件的模式、步数和胜者标签。"""
+    def _parse_replay_meta(self, relpath):
+        """快速解析回放文件的模式、步数和胜者标签。relpath 相对 replays/ 根目录。"""
         import json
-        filepath = os.path.join(os.path.dirname(__file__), 'replays', fname)
+        filepath = os.path.join(os.path.dirname(__file__), 'replays', relpath)
         steps = 0
         winner = None
         game_info = {}
@@ -2162,6 +2227,8 @@ class Game:
                 winner_label = '玩家胜'
             else:
                 winner_label = 'AI胜'
+        elif mode == 'ai_vs_ai':
+            winner_label = '红方胜' if winner == 'RED' else '蓝方胜'
         else:
             winner_label = '红队胜' if winner == 'RED' else '蓝队胜'
 
@@ -2175,6 +2242,8 @@ class Game:
             return '单人'
         elif mode == 'ai':
             return 'AI'
+        elif mode == 'ai_vs_ai':
+            return 'AI对弈'
         elif mode == 'network':
             role = game_info.get('role', '')
             return '联机-红' if role == 'host' else '联机-蓝'
@@ -2275,7 +2344,7 @@ class Game:
                 return
 
         # AI 托管按钮（左下角，仅 AI 对战模式且配置允许时显示；不绑快捷键）
-        if ('ai' in AI_CUSTODY_ALLOWED_MODES and self._ai_mode
+        if ('ai' in AI_CUSTODY_ALLOWED_MODES and self._ai_mode and not self._ai_vs_ai
                 and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
                 and self.ai_custody_rect.collidepoint(event.pos)):
             play_sfx('click')
@@ -2296,7 +2365,9 @@ class Game:
 
         # 网络模式/AI模式：非己方回合时只允许鼠标移动
         if self._ai_mode:
-            if self._ai_custody and self.current_team == self.my_team:
+            if self._ai_vs_ai:
+                is_my_turn = False  # AI 对弈：纯 AI 自动，玩家不可操作
+            elif self._ai_custody and self.current_team == self.my_team:
                 is_my_turn = False  # 玩家队伍已托管，交给 AI 操作
             else:
                 is_my_turn = (self.current_team != self._ai_team)
@@ -2957,10 +3028,11 @@ class Game:
 
                 _offset = -4
 
-                # 左侧：日期时间
-                date_label = fname
-                if len(fname) >= 15:
-                    date_label = f"{fname[:4]}-{fname[4:6]}-{fname[6:8]}  {fname[9:11]}:{fname[11:13]}:{fname[13:15]}"
+                # 左侧：日期时间（用文件名，不含子目录前缀）
+                base = os.path.basename(fname)
+                date_label = base
+                if len(base) >= 15:
+                    date_label = f"{base[:4]}-{base[4:6]}-{base[6:8]}  {base[9:11]}:{base[11:13]}:{base[13:15]}"
                 c = WHITE if is_selected else GRAY
                 date_txt = font_mid.render(date_label, True, c)
                 surface.blit(date_txt, (SCREEN_WIDTH // 2 - 290, y + _offset))
@@ -3170,6 +3242,7 @@ class Game:
         del_dir = os.path.join(os.path.dirname(__file__), 'replays', 'deleted')
         os.makedirs(del_dir, exist_ok=True)
         dst = os.path.join(del_dir, fname)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)  # 子目录回放（如 ai_vs_ai/）需要建目录
         shutil.move(src, dst)
         del self._replay_files[self._replay_selected]
         play_sfx('shear')
