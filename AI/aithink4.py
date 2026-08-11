@@ -1738,7 +1738,8 @@ class AIThinker:
         self.observe_opponent(game.nodes)
         key = (game.turn_count, game.current_team)
         if self.mem.get('turn_key') != key:
-            for k in ('reinforce_done', 'last_target', 'stall_turns'):
+            # last_target 必须跨回合保留：重复路线检测 (similar_turns) 依赖上一回合落点
+            for k in ('reinforce_done', 'stall_turns'):
                 self.mem.pop(k, None)
             self.mem['turn_key'] = key
         self.sit = self.analyze_situation()
@@ -1820,7 +1821,17 @@ class AIThinker:
             return self._plan_fallback
         best = self._plan_all[0]
         self.last_cands = self._plan_viz()
+        # 换路线检测: 与上次操作"极度相似"(同一父节点 + 目标点高度重合) → 重复计数+1
+        # （与 best_placement 尾部一致；planner 路径下 last_target 已跨回合保留）
+        prev_t = self.mem.get('last_target')
+        prev_p = self.mem.get('last_parent_id')
+        same_parent = (prev_p is not None and best[1].id == prev_p)
+        if prev_t is not None and same_parent and _dist(best[2][0], best[2][1], prev_t[0], prev_t[1]) < 60.0:
+            self.mem['similar_turns'] = self.mem.get('similar_turns', 0) + 1
+        else:
+            self.mem['similar_turns'] = 1  # 路线变化则重置
         self.mem['last_target'] = (best[2][0], best[2][1])
+        self.mem['last_parent_id'] = best[1].id
         self._remember_placement(best[2][0], best[2][1])
         self.mem['last_placed_en'] = self.sit.en_nodes
         self.mem['stall_turns'] = 0
@@ -1984,9 +1995,10 @@ class AIThinker:
         self.observe_opponent(game.nodes)
 
         # 回合级记忆重置 (last_placed 已由 _update_memory 消费; 不重置 last_placed_en/no_progress)
+        # last_target 跨回合保留：重复路线检测 (similar_turns) 依赖上一回合落点
         key = (game.turn_count, game.current_team)
         if self.mem.get('turn_key') != key:
-            for k in ('reinforce_done', 'last_target', 'stall_turns'):
+            for k in ('reinforce_done', 'stall_turns'):
                 self.mem.pop(k, None)
             self.mem['turn_key'] = key
 
