@@ -527,6 +527,10 @@ class AIThinker:
         """检查己方所有历史落点, 把已被摧毁的位置记入'打地鼠'禁区。
         (修复: 旧版只记最近一次落点, 若 AI 落点A后再落点B, A被摧毁时无法记录,
          导致反复在 A 重建。现改为跟踪全部历史落点。)
+
+        同时维护互剪僵局计数 cut_streak: 连续 N 次落点都被立刻剪掉 → 说明
+        双方在互剪 (回放 20260811_185653 陷入 600+ 回合互剪循环), 后续评分
+        会大幅降低剪击收益、放大推进收益来强制破局。
         """
         mem = self.mem
         placements = mem.get('my_placements', [])
@@ -543,6 +547,12 @@ class AIThinker:
                     if len(kt) > 10:
                         kt.pop(0)
         mem['my_placements'] = alive
+        # 互剪僵局: 上一次落点 (placements[-1]) 若已被剪 → cut_streak+1, 否则清零
+        prev_last = placements[-1] if placements else None
+        if prev_last is not None and prev_last not in alive:
+            mem['cut_streak'] = mem.get('cut_streak', 0) + 1
+        else:
+            mem['cut_streak'] = 0
 
     def _remember_placement(self, x, y):
         """记录一次己方落子位置, 供 _update_memory 追踪是否被摧毁。"""
@@ -1208,6 +1218,19 @@ class AIThinker:
         atk = str_                      # Python: 新树枝伤害 = 新节点强度
 
         s = 0.5
+        # ---- 互剪僵局破局: 连续被剪 cut_streak>=2 → 剪击收益降权, 推进收益放大 ----
+        # 互剪僵局里 (回放 20260811_185653: 600+ 回合互剪), 双方每回合各剪掉对方一个
+        # 重建节点, 剪击收益 1532.97 始终压过推进收益, 谁都不愿推进 → 死循环。
+        # cut_streak 记录"上次落点被对方立刻剪掉"的连续次数 (见 _update_memory),
+        # 越高说明陷得越深: 剪击越不值钱、推进越值钱, 强制把博弈推向分胜负。
+        cut = self.mem.get('cut_streak', 0)
+        if cut >= 3:
+            cut_atk, adv_boost = 0.25, 3.0
+        elif cut >= 2:
+            cut_atk, adv_boost = 0.5, 2.0
+        else:
+            cut_atk, adv_boost = 1.0, 1.0
+
         # 记忆: 朝上次落点方向轻微推进
         last = self.mem.get('last_target')
         if last:
@@ -1285,10 +1308,10 @@ class AIThinker:
         if spine_cut > 0:
             s += spine_cut * 400.0 * dyn_dfn
 
-        s += nodes_hit * cfg.node_hit * atk * dyn_atk
-        s += hub_value * cfg.hub_factor * atk * dyn_atk
-        s += edges_dead * cfg.edge_kill * atk * dyn_atk
-        s += (edges_hit - edges_dead) * cfg.edge_hit * dyn_atk
+        s += nodes_hit * cfg.node_hit * atk * dyn_atk * cut_atk
+        s += hub_value * cfg.hub_factor * atk * dyn_atk * cut_atk
+        s += edges_dead * cfg.edge_kill * atk * dyn_atk * cut_atk
+        s += (edges_hit - edges_dead) * cfg.edge_hit * dyn_atk * cut_atk
 
         # 从根节点开新枝且无战果 → 惩罚 (鼓励从已有前线推进)
         if parent.parent is None and len(parent.children) >= 1:
@@ -1331,7 +1354,7 @@ class AIThinker:
             # 饱和推进: 60px 内线性, 之后收益递减, 到 cap 封顶
             adv_eff = adv_gain if adv_gain < 60.0 else 60.0 + (adv_gain - 60.0) * 0.4
             adv_eff = min(adv_eff, cfg.advance_cap)
-            s += adv_eff * cfg.advance * dyn_atk
+            s += adv_eff * cfg.advance * dyn_atk * adv_boost
         else:
             s += adv_gain * cfg.advance * dyn_atk
         if collected and d_to > d_from:
@@ -1890,8 +1913,11 @@ class AIThinker:
     def _update_similar_turns(self, tx, ty, parent_id):
         """记录本次落点并维护重复路线检测状态。
 
-        - recent_targets: 最近 5 次落点窗口 (x, y, parent_id)，用于检测互剪循环。
+        - recent_targets: 最近 15 次落点窗口 (x, y, parent_id)，用于检测互剪循环。
         - similar_turns / last_target / last_parent_id: 兼容保留（score_target 软惩罚用）。
+
+        similar_turns 不看父节点：互剪循环里 AI 每次被剪后从不同父节点重建同一位置
+        （回放 20260811_185653），只按落点位置相近即可累计，否则永远检测不到。
 
         所有产生 place_node 的决策出口统一调用（planner / 绝望兜底 / 紧急拾取），
         避免死循环检测只在 planner 路径生效、其他路径无限重复同一落点。
@@ -1899,12 +1925,10 @@ class AIThinker:
         mem = self.mem
         recent = mem.setdefault('recent_targets', [])
         recent.append((tx, ty, parent_id))
-        if len(recent) > 5:
+        if len(recent) > 15:
             recent.pop(0)
         prev_t = mem.get('last_target')
-        prev_p = mem.get('last_parent_id')
-        same_parent = (prev_p is not None and parent_id == prev_p)
-        if prev_t is not None and same_parent and _dist(tx, ty, prev_t[0], prev_t[1]) < 60.0:
+        if prev_t is not None and _dist(tx, ty, prev_t[0], prev_t[1]) < 60.0:
             mem['similar_turns'] = mem.get('similar_turns', 0) + 1
         else:
             mem['similar_turns'] = 1  # 路线变化则重置
@@ -1915,17 +1939,16 @@ class AIThinker:
     def _in_repeat_zone(self, tx, ty, parent=None):
         """目标是否落在重复落点区域内。
 
-        检测互剪循环: 最近 5 次落点中, 从同一父节点落在目标附近(<40px) ≥2 次 → 判定循环。
-        40px 严格阈值 + 同父过滤, 只命中"反复在同一处落子被互剪"的模式,
-        不会误伤链式推进 (每步换父节点) 或扇形扩张 (目标分散)。
+        检测互剪循环: 最近 15 次落点中, 落在目标附近(<40px) ≥2 次 → 判定循环。
+        只按位置判定, 不看父节点: 互剪时 AI 被剪后从不同父节点重建同一位置
+        （回放 20260811_185653: 红队 188→18→202→216 反复重建同一落点, 父节点一直在换），
+        加同父过滤会漏掉这类循环。40px 严格阈值 < 节点最小间距(40), 不会误伤链式推进。
         """
         recent = self.mem.get('recent_targets', [])
         if len(recent) < 2:
             return False
         count = 0
         for x, y, pid in recent:
-            if parent is not None and pid != parent:
-                continue
             if (tx - x) ** 2 + (ty - y) ** 2 < 40 * 40:
                 count += 1
         return count >= 2

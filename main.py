@@ -78,13 +78,26 @@ def _load_one(filename):
         print(f"[SFX] 加载失败: {path} - {e}")
 
 
-def _play_file(fname: str):
+def _play_file(fname: str, force: bool = False):
     snd = _sfx_bank.get(fname)
-    if snd:
-        snd.play()
-        if DEBUG_MODE:
-            fname_short = fname.rsplit('.', 1)[0]  # 去扩展名
-            add_debug_log(f"Sound - {fname_short}", (-1, -1, -1))
+    if not snd:
+        return
+    if force:
+        # 抢占一个声道保证发声: AI 对弈音效密集 (tap/shear/orb 各 0.3~0.4s),
+        # 8 声道易被占满, 此时 snd.play() 返回 None 静默失败 → game over 音效
+        # 间歇性丢失 (玩家 vs AI 能听到、AI 对弈有时听不到的原因)。
+        # find_channel(force=True) 夺取一个正在播放的声道, 用于 game over 音效可接受。
+        ch = pygame.mixer.find_channel(True)
+        if ch is not None:
+            ch.play(snd)
+            if DEBUG_MODE:
+                fname_short = fname.rsplit('.', 1)[0]  # 去扩展名
+                add_debug_log(f"Sound - {fname_short}", (-1, -1, -1))
+            return
+    snd.play()
+    if DEBUG_MODE:
+        fname_short = fname.rsplit('.', 1)[0]  # 去扩展名
+        add_debug_log(f"Sound - {fname_short}", (-1, -1, -1))
 
 
 def add_debug_log(text, color=(-1, -1, -1), duration_ms=None):
@@ -131,13 +144,14 @@ def draw_debug_logs(surface, font=None, padding_x=10, padding_bottom=20, gap=16,
         surface.blit(txt, (padding_x, SCREEN_HEIGHT - padding_bottom - i * gap))
 
 
-def play_sfx(name, **kwargs):
+def play_sfx(name, force=False, **kwargs):
     """统一音效播放入口。
     - tap:     kwargs['strength'] = 1~5 → 对应音调
     - shear:   全随机 6 变调
     - orb:     kwargs['value'] = 1~3 → 分段随机
     - click:   固定 x1.00
     - 其他:    单文件 (join_leave, victory, heavy_hit)
+    - force:   抢占声道保证发声 (game over 音效用, 见 _play_file)
     """
     if "SOUNDS_DISABLED" in DEBUGS:
         return
@@ -155,10 +169,94 @@ def play_sfx(name, **kwargs):
         fname = random.choice(IDLE_SOUNDS)
     else:
         fname = f'{name}.ogg'
-    _play_file(fname)
+    _play_file(fname, force=force)
+
+
+class ConfirmDialog:
+    """通用确认弹窗 HUD：半透明遮罩 + 标题 + 正文 + 取消/确认按钮。
+
+    用法（主菜单静默模式 / 设置页重置 AI 参数共用）：
+        创建:  self._dialog = ConfirmDialog(title=..., body=[...], ok_text=...)
+        绘制:  每帧 self._dialog.draw(surface, mouse_pos)（按钮 rect 自动更新）
+        事件:  result = self._dialog.handle_event(event)，返回：
+                 'ok'     → 点确认按钮 / 按 Enter
+                 'cancel' → 点取消按钮 / 点遮罩任意处 / 按 Esc
+                 None     → 弹窗未消费该事件（打开期间应屏蔽外部交互）
+    """
+    def __init__(self, title, body=(), ok_text="确认", cancel_text="取消",
+                 ok_color=(165, 55, 48), ok_hover=(210, 75, 60),
+                 title_color=(255, 210, 130), border_color=(220, 130, 120),
+                 width=480, height=230):
+        self.title = title
+        self.body = list(body)
+        self.ok_text = ok_text
+        self.cancel_text = cancel_text
+        self.ok_color = ok_color
+        self.ok_hover = ok_hover
+        self.title_color = title_color
+        self.border_color = border_color
+        self.width = width
+        self.height = height
+        # 每帧 draw() 时重建的按钮矩形（handle_event 用）
+        self.ok_rect = None
+        self.cancel_rect = None
+        self.panel_rect = None
+
+    def draw(self, surface, mouse_pos):
+        """绘制遮罩 + 面板 + 按钮，并更新 ok_rect/cancel_rect。"""
+        mask = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+        mask.fill((0, 0, 0, 150))
+        surface.blit(mask, (0, 0))
+        pw, ph = self.width, self.height
+        panel = pygame.Rect(SCREEN_WIDTH // 2 - pw // 2, SCREEN_HEIGHT // 2 - ph // 2, pw, ph)
+        self.panel_rect = panel
+        pygame.draw.rect(surface, (55, 55, 75), panel, border_radius=10)
+        pygame.draw.rect(surface, self.border_color, panel, 2, border_radius=10)
+        # 标题
+        ttl = font_mid.render(self.title, True, self.title_color)
+        surface.blit(ttl, ttl.get_rect(center=(panel.centerx, panel.y + 38)))
+        # 正文（多行，逐行下移）
+        for i, line in enumerate(self.body):
+            dl = font_small.render(line, True, (200, 200, 210))
+            surface.blit(dl, dl.get_rect(center=(panel.centerx, panel.y + 88 + i * 26)))
+        # 按钮：左侧取消，右侧确认
+        btn_w, btn_h = 150, 42
+        cancel_r = pygame.Rect(panel.centerx - btn_w - 20, panel.y + ph - 64, btn_w, btn_h)
+        ok_r = pygame.Rect(panel.centerx + 20, panel.y + ph - 64, btn_w, btn_h)
+        _h = cancel_r.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, (125, 125, 135) if _h else (90, 90, 100), cancel_r, border_radius=6)
+        pygame.draw.rect(surface, WHITE, cancel_r, 1, border_radius=6)
+        ct = font_mid.render(self.cancel_text, True, WHITE)
+        surface.blit(ct, ct.get_rect(center=cancel_r.center))
+        _h = ok_r.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, self.ok_hover if _h else self.ok_color, ok_r, border_radius=6)
+        pygame.draw.rect(surface, WHITE, ok_r, 1, border_radius=6)
+        ot = font_mid.render(self.ok_text, True, WHITE)
+        surface.blit(ot, ot.get_rect(center=ok_r.center))
+        self.cancel_rect = cancel_r
+        self.ok_rect = ok_r
+
+    def handle_event(self, event):
+        """处理弹窗事件，返回 'ok' / 'cancel' / None（未消费）。"""
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_RETURN:
+                return 'ok'
+            if event.key == pygame.K_ESCAPE:
+                return 'cancel'
+            return None
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.ok_rect and self.ok_rect.collidepoint(event.pos):
+                return 'ok'
+            # 点"取消"按钮或遮罩任意处 = 取消
+            return 'cancel'
+        return None
 
 
 # ===== 音效系统 =====
+# AI 对弈 1 帧思考时 tap/shear/orb 音效 (各 0.3~0.4s) 快速堆积, 默认 8 声道易被
+# 占满 → 第 9 个音效 snd.play() 返回 None 静默丢失。提高声道数降低丢失率。
+# 声道数读自 config.json audio.channels (4~64), 设置页"音频"分类可调。
+pygame.mixer.set_num_channels(AUDIO_CHANNELS)
 _load_all_sfx()
 # ===== 音效系统 END =====
 
@@ -221,13 +319,18 @@ def _draw_aa_circle_outline(surface, color, center, radius, width=1):
         pass
 
 
-screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-pygame.display.set_caption(f"Binary Tree Battle - {VERSION}")
-clock = pygame.time.Clock()
-add_debug_log("调试模式已激活, 调试选项:", (-1, -1, -1), 3000)
-for i in DEBUGS:
-    add_debug_log(f" - {i}", (-1, -1, -1), 3000)
-play_sfx('victory')
+# 静默训练模式 (silent.py 启动): 不创建主窗口/不播开始音效, 由 silent.py 自建小窗口
+if os.environ.get('BTB_SILENT'):
+    screen = None
+    clock = None
+else:
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+    pygame.display.set_caption(f"Binary Tree Battle - {VERSION}")
+    clock = pygame.time.Clock()
+    add_debug_log("调试模式已激活, 调试选项:", (-1, -1, -1), 3000)
+    for i in DEBUGS:
+        add_debug_log(f" - {i}", (-1, -1, -1), 3000)
+    play_sfx('victory')
 
 
 class Node:
@@ -395,6 +498,19 @@ class Game:
         self.connect_error = None  # 连接错误信息
         self.host_port = DEFAULT_PORT
         self.fps = FPS             # 当前帧率（可在设置页修改，实时生效）
+
+        # 通用确认弹窗（主菜单静默模式 / 设置页重置 AI 参数）：None=未弹出
+        self._menu_dialog = None
+        self._settings_confirm = None
+        # 静默 AI 对弈开关（设置页"AI"分类可改，读 config.json ai.silent_ai）
+        self._silent_ai_enabled = False
+        try:
+            import json as _json
+            with open(os.path.join(os.path.dirname(__file__), 'config.json'),
+                      'r', encoding='utf-8') as _f:
+                self._silent_ai_enabled = bool(_json.load(_f).get('ai', {}).get('silent_ai', False))
+        except Exception:
+            self._silent_ai_enabled = False
 
         # 联机状态追踪（用于进出提示音）
         self._last_remote_connected = False
@@ -621,6 +737,10 @@ class Game:
         )
         label = {'win': '胜', 'loss': '负', 'draw': '平'}[result]
         print(f"[AI学习] 记录本局结果: {label} (回合 {self.turn_count}), 权重已更新并备份")
+        # AI 对弈模式 game over 音效已由 update() STATE_GAME_OVER 分支统一播放
+        # (force 抢占声道, 见该分支); 此处只服务玩家 vs AI 返回菜单的播放, 避免同帧双播。
+        if not getattr(self, '_ai_vs_ai', False):
+            _play_file('heavy_hit.ogg', force=True)
 
     # ===== 联机动作系统 =====
 
@@ -834,7 +954,7 @@ class Game:
             if self.network_mode != 'client':
                 # AI 对弈模式：统一在 game over 屏幕播放失败音效（每局仅一次，不论胜负）
                 if self._ai_vs_ai and not self._ai_game_over_sfx_played:
-                    play_sfx('heavy_hit')
+                    play_sfx('heavy_hit', force=True)
                     self._ai_game_over_sfx_played = True
                 fname = self.replay.save()
                 if fname:
@@ -1659,6 +1779,10 @@ class Game:
         ver_text = font_tiny.render(f"Binary Tree Battle {VERSION}  by {AUTHOR}", True, (80, 80, 100))
         surface.blit(ver_text, (SCREEN_WIDTH - ver_text.get_width() - 12, SCREEN_HEIGHT - 22))
 
+        # 静默模式确认弹窗（最上层）
+        if self._menu_dialog is not None:
+            self._menu_dialog.draw(surface, mouse_pos)
+
     # ===== 游戏结束绘制 =====
     def draw_game_over(self, surface):
         surface.fill(BG_COLOR)
@@ -2059,6 +2183,20 @@ class Game:
         if event.type == pygame.QUIT:
             pygame.quit()
             sys.exit()
+        # 静默模式确认弹窗：弹出期间屏蔽其它菜单交互
+        if self._menu_dialog is not None:
+            result = self._menu_dialog.handle_event(event)
+            if result is not None:
+                self._menu_dialog = None
+                if result == 'ok':
+                    # 启动静默训练独立进程（新窗口），并关闭本主窗口
+                    import subprocess
+                    root = os.path.dirname(os.path.abspath(__file__))
+                    subprocess.Popen([sys.executable, os.path.join(root, 'silent.py')])
+                    pygame.quit()
+                    sys.exit()
+                play_sfx('click')
+            return
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if hasattr(self, '_btn_single') and self._btn_single.collidepoint(event.pos):
                 play_sfx('click')
@@ -2079,7 +2217,22 @@ class Game:
                 self._enter_replay_select()
             elif hasattr(self, '_btn_ai_vs_ai') and self._btn_ai_vs_ai.collidepoint(event.pos):
                 play_sfx('click')
-                self.start_ai_vs_ai_game()
+                if self._silent_ai_enabled:
+                    # 静默模式：弹确认框，确认后进入静默训练窗口
+                    self._menu_dialog = ConfirmDialog(
+                        title="静默模式",
+                        body=["将关闭本窗口，在新窗口中静默训练 AI。",
+                              "训练仅学习并保存参数，不保存回放。",
+                              "进入后无法返回本主菜单。"],
+                        ok_text="继续",
+                        cancel_text="取消",
+                        ok_color=(60, 150, 70),
+                        ok_hover=(80, 180, 90),
+                        title_color=(140, 255, 170),
+                        border_color=(110, 200, 120),
+                    )
+                else:
+                    self.start_ai_vs_ai_game()
             elif hasattr(self, '_btn_settings') and self._btn_settings.collidepoint(event.pos):
                 play_sfx('click')
                 self._enter_settings()
@@ -2093,8 +2246,10 @@ class Game:
     # 设置页二级目录结构：一级分类 → [(key, 标签, 描述), ...]
     _SETTINGS_CATS = [
         ("显示", [("fps", "最高 FPS", "实时生效")]),
+        ("音频", [("channels", "音效声道数", "4~64，实时生效")]),
         ("AI", [("ai_frames", "AI 思考时间", "上限 1.5s，实时生效"),
-                ("reset_ai", "重置 AI 参数", "点击确认恢复出厂权重")]),
+                ("silent_ai", "静默 AI 对弈", "开启后主菜单AI对弈进入静默训练"),
+                ("reset_ai", "重置 AI 参数", "点击右侧按钮确认后恢复出厂权重")]),
         ("网络", [("port", "默认端口", "下次建房/连接生效")]),
     ]
 
@@ -2112,15 +2267,19 @@ class Game:
         self._settings_fps = cfg.get('display', {}).get('fps', FPS)
         self._settings_ai_frames = cfg.get('ai', {}).get('think_delay_frames', AI_THINK_DELAY)
         self._settings_port = cfg.get('network', {}).get('default_port', DEFAULT_PORT)
+        self._settings_channels = max(4, min(64, cfg.get('audio', {}).get('channels', AUDIO_CHANNELS)))
+        self._settings_silent_ai = bool(cfg.get('ai', {}).get('silent_ai', False))
         # AI 思考时间上限 1.5s
         max_frames = max(1, int(self._settings_fps * 1.5))
         self._settings_ai_frames = min(self._settings_ai_frames, max_frames)
         self._settings_cat = 0   # 一级目录索引
         self._settings_index = 0  # 当前分类内的二级条目索引
         self._settings_notice = None  # 设置页临时提示 (text, tick)
+        # 确认弹窗（ConfirmDialog 实例，如"重置 AI 参数"）；None=未弹出
+        self._settings_confirm = None
         # 鼠标交互矩形（每帧绘制时重建）
         self._settings_cat_rects = []    # [(idx, rect), ...]
-        self._settings_item_rects = []   # [(key, rect, minus_rect, plus_rect), ...]
+        self._settings_item_rects = []   # [(key, rect, minus_rect, plus_rect, action_rect), ...]
         self._settings_back_rect = None
         # 键盘键入编辑状态（端口 / AI 思考时间）
         self._settings_editing = None    # 正在键入的条目 key，None=未编辑
@@ -2213,6 +2372,18 @@ class Game:
                 self._settings_commit_edit()
             return
 
+        # ===== 确认弹窗（重置 AI 参数等） =====
+        # 危险操作必须二次确认：Esc / 点遮罩或取消取消；点"确认"(或 Enter) 才执行。
+        if self._settings_confirm is not None:
+            result = self._settings_confirm.handle_event(event)
+            if result is not None:
+                self._settings_confirm = None
+                if result == 'ok':
+                    self._reset_ai_weights()
+                else:
+                    play_sfx('click')
+            return
+
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 play_sfx('click')
@@ -2246,8 +2417,9 @@ class Game:
                         self._settings_index = 0
                         play_sfx('click')
                     return
-            # 二级条目：点条目选中；端口/AI思考时间点击进入键入；FPS 点 +/- 调整
-            for key, rect, minus_rect, plus_rect in getattr(self, '_settings_item_rects', []):
+            # 二级条目：点条目选中；端口/AI思考时间点击进入键入；FPS/声道数点 +/- 调整；
+            # 重置按钮(action_rect)需单独点击才触发确认弹窗，点整条不触发。
+            for key, rect, minus_rect, plus_rect, action_rect in getattr(self, '_settings_item_rects', []):
                 if key in ('port', 'ai_frames') and rect.collidepoint(pos):
                     for i, item in enumerate(self._SETTINGS_CATS[self._settings_cat][1]):
                         if item[0] == key:
@@ -2263,23 +2435,44 @@ class Game:
                 if minus_rect and minus_rect.collidepoint(pos):
                     self._adjust_setting(-1, key=key)
                     return
+                if action_rect and action_rect.collidepoint(pos):
+                    for i, item in enumerate(self._SETTINGS_CATS[self._settings_cat][1]):
+                        if item[0] == key:
+                            self._settings_index = i
+                            break
+                    if key == 'reset_ai':
+                        # 危险操作：先弹确认框，确认后才执行重置
+                        self._settings_confirm = ConfirmDialog(
+                            title="确认重置 AI 参数？",
+                            body=["将恢复出厂默认权重并立即生效。",
+                                  "当前参数会自动备份到 AI/backup/。"],
+                            ok_text="确认重置",
+                        )
+                    elif key == 'silent_ai':
+                        # 开关：点击右侧切换按钮切换
+                        self._settings_silent_ai = not self._settings_silent_ai
+                        self._apply_settings()
+                    play_sfx('click')
+                    return
                 if rect.collidepoint(pos):
                     for i, item in enumerate(self._SETTINGS_CATS[self._settings_cat][1]):
                         if item[0] == key:
                             self._settings_index = i
                             break
                     play_sfx('tap', strength=2)
-                    if key == 'reset_ai':
-                        self._reset_ai_weights()
                     return
 
     def _adjust_setting(self, direction, key=None):
         """调整设置项（direction=-1 减少 / +1 增加），改后立即保存并应用。
-        仅 FPS 使用增减；端口与 AI 思考时间改为键盘键入。"""
+        仅 FPS 与音效声道数使用增减；端口与 AI 思考时间改为键盘键入。"""
         if key is None:
             key = self._current_setting_key()
         if key == 'fps':                 # 最高 FPS
             self._settings_fps = max(15, min(240, self._settings_fps + direction * 5))
+            play_sfx('tap', strength=2)
+            self._apply_settings()
+        elif key == 'channels':          # 音效声道数 (4~64)
+            self._settings_channels = max(4, min(64, self._settings_channels + direction * 2))
             play_sfx('tap', strength=2)
             self._apply_settings()
 
@@ -2289,6 +2482,7 @@ class Game:
         self.fps = self._settings_fps
         self._AI_THINK_DELAY = self._settings_ai_frames
         self.host_port = self._settings_port
+        pygame.mixer.set_num_channels(self._settings_channels)  # 实时调整声道数
         # 写回配置文件（原子写，避免写坏）
         import json
         cfg_path = os.path.join(os.path.dirname(__file__), 'config.json')
@@ -2300,8 +2494,12 @@ class Game:
             except (json.JSONDecodeError, OSError):
                 cfg = {}
         cfg.setdefault('display', {})['fps'] = self._settings_fps
+        cfg.setdefault('audio', {})['channels'] = self._settings_channels
         cfg.setdefault('ai', {})['think_delay_frames'] = self._settings_ai_frames
+        cfg.setdefault('ai', {})['silent_ai'] = self._settings_silent_ai
         cfg.setdefault('network', {})['default_port'] = self._settings_port
+        # 同步主菜单使用的静默开关（设置页修改后立即生效）
+        self._silent_ai_enabled = self._settings_silent_ai
         try:
             tmp = cfg_path + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as f:
@@ -2390,13 +2588,14 @@ class Game:
             surface.blit(db, (rect.x + 14, rect.y + 34))
 
             # 右侧值区域（垂直居中，避免与描述重叠）
-            plus_rect = minus_rect = None
-            if key == 'fps':
+            plus_rect = minus_rect = action_rect = None
+            if key in ('fps', 'channels'):
                 btn_w, btn_h = 36, 32
                 plus_rect = pygame.Rect(rect.right - btn_w - 12, rect.centery - btn_h // 2, btn_w, btn_h)
                 minus_rect = pygame.Rect(plus_rect.x - 12 - btn_w, rect.centery - btn_h // 2, btn_w, btn_h)
                 # 值文本右对齐到减号按钮左侧，避免被按钮遮挡
-                val = font_mid.render(f"{self._settings_fps}", True, (255, 215, 0))
+                val_text = f"{self._settings_fps}" if key == 'fps' else f"{self._settings_channels}"
+                val = font_mid.render(val_text, True, (255, 215, 0))
                 val_rect = val.get_rect(right=minus_rect.left - 14, centery=rect.centery)
                 surface.blit(val, val_rect)
                 for _r, _sym in ((minus_rect, "−"), (plus_rect, "+")):
@@ -2416,16 +2615,28 @@ class Game:
                     disp = self._settings_value_text(key)
                 vt = font_mid.render(disp, True, (255, 215, 0) if not is_edit else WHITE)
                 surface.blit(vt, (val_box.x + 8, val_box.y + (val_box.h - vt.get_height()) // 2))
+            elif key == 'silent_ai':
+                # 右侧开/关切换按钮（点击按钮才切换）
+                sw = pygame.Rect(rect.right - 110, rect.centery - 16, 96, 32)
+                on = self._settings_silent_ai
+                _h = sw.collidepoint(mouse_pos)
+                pygame.draw.rect(surface, (70, 170, 80) if on else (110, 110, 120),
+                                 sw, border_radius=16)
+                pygame.draw.rect(surface, WHITE, sw, 1, border_radius=16)
+                st = font_small.render("开" if on else "关", True, WHITE)
+                surface.blit(st, st.get_rect(center=sw.center))
+                action_rect = sw
             elif key == 'reset_ai':
-                hb = rect.collidepoint(mouse_pos)
+                btn_rect = pygame.Rect(rect.right - 130, rect.centery - 15, 116, 30)
+                hb = btn_rect.collidepoint(mouse_pos)
                 pygame.draw.rect(surface, (150, 60, 60) if hb else (110, 45, 45),
-                                 pygame.Rect(rect.right - 130, rect.centery - 15, 116, 30), border_radius=4)
-                pygame.draw.rect(surface, WHITE,
-                                 pygame.Rect(rect.right - 130, rect.centery - 15, 116, 30), 1, border_radius=4)
+                                 btn_rect, border_radius=4)
+                pygame.draw.rect(surface, WHITE, btn_rect, 1, border_radius=4)
                 bt = font_small.render("重置", True, WHITE)
-                surface.blit(bt, bt.get_rect(center=(rect.right - 72, rect.centery)))
+                surface.blit(bt, bt.get_rect(center=btn_rect.center))
+                action_rect = btn_rect
 
-            self._settings_item_rects.append((key, rect, minus_rect, plus_rect))
+            self._settings_item_rects.append((key, rect, minus_rect, plus_rect, action_rect))
 
         # ===== 底部返回按钮 =====
         back_rect = pygame.Rect(SCREEN_WIDTH - 120, SCREEN_HEIGHT - 50, 100, 34)
@@ -2447,8 +2658,12 @@ class Game:
         if self._settings_editing:
             tip = font_tiny.render("输入数字后回车确认 | Esc 取消 | 点击其他位置提交", True, (120, 200, 255))
         else:
-            tip = font_tiny.render("鼠标点击选择 | 端口/AI思考时间: 点击输入 | FPS: [-] [+] | ↑/↓ 选择 | Esc 返回", True, DARK_GRAY)
+            tip = font_tiny.render("鼠标点击选择 | 端口/AI思考时间: 点击输入 | FPS/声道数: [-] [+] | ↑/↓ 选择 | Esc 返回", True, DARK_GRAY)
         surface.blit(tip, tip.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 40)))
+
+        # ===== 确认弹窗（重置 AI 参数等） =====
+        if self._settings_confirm is not None:
+            self._settings_confirm.draw(surface, mouse_pos)
 
     def _enter_replay_select(self):
         """进入回放文件选择界面。解析每个回放的步数和胜者。

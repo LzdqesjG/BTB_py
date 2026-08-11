@@ -102,6 +102,9 @@ DEFAULT_PORT = _config.get('network', {}).get('default_port', 8447)
 # ===== 音效配置 =====
 SOUND_DIR = os.path.join(os.path.dirname(__file__), 'assets', 'sounds')
 
+# 混音声道数 (4~64, 设置页"音频"分类可调, 写回 config.json audio.channels)
+AUDIO_CHANNELS = max(4, min(64, _config.get('audio', {}).get('channels', 32)))
+
 # 强度 → 音调 (click_stereo)
 TAP_SOUNDS = {
     1: 'click_stereo_x1.05.ogg',
