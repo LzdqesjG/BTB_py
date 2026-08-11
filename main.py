@@ -2445,24 +2445,41 @@ class Game:
         surface.blit(tip, tip.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 40)))
 
     def _enter_replay_select(self):
-        """进入回放文件选择界面。解析每个回放的步数和胜者。
+        """进入回放文件选择界面（二级目录）。
 
-        递归扫描 replays/ 目录（含 ai_vs_ai 子目录），
-        列表项存储相对 replays/ 的路径。
+        第一级：按目录分组（顶层=普通对局，子目录=AI对弈/调试等），显示分类列表；
+        第二级：进入分类后显示该目录下的回放文件列表。
+        递归扫描 replays/ 目录，列表项存储相对 replays/ 的路径。
         """
+        # 子目录 → 友好分类名
+        _CAT_NAMES = {'ai_vs_ai': 'AI 对弈', 'debug': '调试回放'}
         replay_root = os.path.join(os.path.dirname(__file__), 'replays')
-        rels = []
+        groups = {}  # 分类名 → [rel, ...]
         if os.path.isdir(replay_root):
             for dirpath, _dirnames, filenames in os.walk(replay_root):
+                rel_dir = os.path.relpath(dirpath, replay_root)
                 for f in filenames:
                     if f.endswith('.bpr'):
-                        rels.append(os.path.relpath(os.path.join(dirpath, f), replay_root))
-            rels.sort(key=lambda rel: os.path.basename(rel), reverse=True)
+                        rel = os.path.relpath(os.path.join(dirpath, f), replay_root)
+                        if rel_dir == '.':
+                            cat = '普通对局'
+                        else:
+                            cat = _CAT_NAMES.get(rel_dir, rel_dir)
+                        groups.setdefault(cat, []).append(rel)
+        # 分类内文件按文件名倒序（最新在前）
+        self._replay_cats = []
+        for cat, rels in groups.items():
+            rels.sort(key=lambda r: os.path.basename(r), reverse=True)
+            files = []
+            for rel in rels:
+                steps, winner_label, mode_label = self._parse_replay_meta(rel)
+                files.append((rel, steps, winner_label, mode_label))
+            self._replay_cats.append((cat, files))
+        # 分类排序：普通对局优先，其余按名称
+        self._replay_cats.sort(key=lambda c: (0 if c[0] == '普通对局' else 1, c[0]))
+        self._replay_cat_active = None   # None=一级目录页；int=当前分类索引
+        self._replay_cat_selected = 0    # 一级目录页选中的分类索引
         self._replay_files = []
-        import json
-        for rel in rels:
-            steps, winner_label, mode_label = self._parse_replay_meta(rel)
-            self._replay_files.append((rel, steps, winner_label, mode_label))
         self._replay_selected = 0
         self._replay_page = 0
         self._replay_delete_mode = False
@@ -3340,14 +3357,72 @@ class Game:
                 self.go_menu()
 
     # ===== 回放系统 =====
-    def draw_replay_select(self, surface):
-        """回放文件选择界面。"""
-        surface.fill(BG_COLOR)
-        title = font_big.render("选择回放文件", True, WHITE)
+
+    def _draw_replay_cat_list(self, surface):
+        """一级目录页：显示回放分类列表（普通对局 / AI对弈 / 调试回放…）。"""
+        title = font_big.render("选择回放", True, WHITE)
         surface.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 60)))
 
         mouse_pos = pygame.mouse.get_pos()
+        self._replay_cat_rects = []
+
+        if not self._replay_cats:
+            hint = font_mid.render("暂无回放文件", True, GRAY)
+            surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2)))
+        else:
+            list_start_y = 140
+            for i, (cat, files) in enumerate(self._replay_cats):
+                y = list_start_y + i * 56
+                rect = pygame.Rect(SCREEN_WIDTH // 2 - 300, y, 600, 48)
+                self._replay_cat_rects.append((i, rect))
+                is_sel = (i == self._replay_cat_selected)
+                is_hover = rect.collidepoint(mouse_pos)
+                if is_sel:
+                    c = (50, 80, 150)
+                elif is_hover:
+                    c = (70, 70, 95)
+                else:
+                    c = (45, 45, 65)
+                pygame.draw.rect(surface, c, rect, border_radius=6)
+                pygame.draw.rect(surface, (180, 200, 230) if is_sel else WHITE, rect, 2, border_radius=6)
+
+                # 左侧：分类名
+                label = font_mid.render(cat, True, WHITE)
+                surface.blit(label, (rect.x + 16, rect.y + (rect.h - label.get_height()) // 2))
+                # 右侧：文件数 + 提示
+                cnt = font_mid.render(f"{len(files)} 个", True, (200, 200, 100))
+                surface.blit(cnt, cnt.get_rect(midright=(rect.right - 16, rect.centery)))
+                if is_sel:
+                    hint_t = font_tiny.render("回车/双击进入", True, (180, 200, 230))
+                    surface.blit(hint_t, hint_t.get_rect(midright=(rect.right - 120, rect.centery)))
+
+        # 底部按钮：返回
+        back_rect = pygame.Rect(SCREEN_WIDTH // 2 - 300, SCREEN_HEIGHT - 46, 90, 32)
+        h = back_rect.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, (60, 140, 160) if h else (35, 90, 110), back_rect, border_radius=6)
+        pygame.draw.rect(surface, WHITE, back_rect, 1, border_radius=6)
+        t = font_small.render("返回", True, WHITE)
+        surface.blit(t, t.get_rect(center=back_rect.center))
+        self._replay_sel_back_rect = back_rect
+
+        hint = font_tiny.render("↑/↓ 选择分类 | 回车/双击进入 | Esc 返回", True, DARK_GRAY)
+        surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 20)))
+
+    def draw_replay_select(self, surface):
+        """回放文件选择界面（二级目录）。"""
+        surface.fill(BG_COLOR)
+
+        mouse_pos = pygame.mouse.get_pos()
         self._replay_row_rects = []
+
+        # ===== 一级目录页 =====
+        if self._replay_cat_active is None:
+            self._draw_replay_cat_list(surface)
+            return
+
+        # ===== 二级文件页 =====
+        title = font_big.render("选择回放文件", True, WHITE)
+        surface.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 60)))
 
         if not self._replay_files:
             hint = font_mid.render("暂无回放文件", True, GRAY)
@@ -3456,11 +3531,65 @@ class Game:
             hint = font_tiny.render("单击选择 / 双击播放 | ↑↓ 选择  ←→ 翻页  Enter 播放  Esc 返回", True, DARK_GRAY)
         surface.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 20)))
 
+    def _replay_enter_cat(self, idx):
+        """进入分类的二级文件页。"""
+        if not (0 <= idx < len(self._replay_cats)):
+            return
+        self._replay_cat_active = idx
+        self._replay_files = self._replay_cats[idx][1]
+        self._replay_selected = 0
+        self._replay_page = 0
+        self._replay_delete_mode = False
+        play_sfx('click')
+
+    def _replay_back_to_cats(self):
+        """从二级文件页返回一级目录页。"""
+        self._replay_cat_active = None
+        self._replay_files = []
+        self._replay_selected = 0
+        self._replay_page = 0
+        self._replay_delete_mode = False
+        play_sfx('click')
+
     def _handle_replay_select_event(self, event):
-        """回放文件选择事件处理。"""
+        """回放文件选择事件处理（二级目录）。"""
         if event.type == pygame.QUIT:
             pygame.quit()
             sys.exit()
+
+        # ===== 一级目录页 =====
+        if self._replay_cat_active is None:
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.state = STATE_MENU
+                elif event.key in (pygame.K_UP, pygame.K_w):
+                    if self._replay_cats:
+                        self._replay_cat_selected = (self._replay_cat_selected - 1) % len(self._replay_cats)
+                        play_sfx('click')
+                elif event.key in (pygame.K_DOWN, pygame.K_s):
+                    if self._replay_cats:
+                        self._replay_cat_selected = (self._replay_cat_selected + 1) % len(self._replay_cats)
+                        play_sfx('click')
+                elif event.key in (pygame.K_RETURN, pygame.K_RIGHT):
+                    self._replay_enter_cat(self._replay_cat_selected)
+            elif event.type == pygame.MOUSEWHEEL:
+                if self._replay_cats:
+                    self._replay_cat_selected = (self._replay_cat_selected + (-1 if event.y > 0 else 1)) % len(self._replay_cats)
+                    play_sfx('click')
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                mp = event.pos
+                if hasattr(self, '_replay_sel_back_rect') and self._replay_sel_back_rect.collidepoint(mp):
+                    play_sfx('click')
+                    self.state = STATE_MENU
+                    return
+                for idx, rect in getattr(self, '_replay_cat_rects', []):
+                    if rect.collidepoint(mp):
+                        self._replay_cat_selected = idx
+                        self._replay_enter_cat(idx)
+                        return
+            return
+
+        # ===== 二级文件页 =====
         if event.type == pygame.KEYDOWN:
             # 删除模式：Del 退出，Enter/Tab 确认删除
             if self._replay_delete_mode:
@@ -3487,7 +3616,9 @@ class Game:
                 return  # 删除模式下忽略其他按键
 
             if event.key == pygame.K_ESCAPE:
-                self.state = STATE_MENU
+                self._replay_back_to_cats()          # 返回一级目录
+            elif event.key == pygame.K_BACKSPACE:
+                self._replay_back_to_cats()
             elif event.key in (pygame.K_LEFT, pygame.K_PAGEUP):
                 self._replay_flip_page(-1)
             elif event.key in (pygame.K_RIGHT, pygame.K_PAGEDOWN):
@@ -3526,10 +3657,9 @@ class Game:
                 play_sfx('click')
                 self._replay_flip_page(1)
                 return
-            # 返回按钮
+            # 返回按钮（二级页 → 返回一级目录）
             if hasattr(self, '_replay_sel_back_rect') and self._replay_sel_back_rect.collidepoint(mp):
-                play_sfx('click')
-                self.state = STATE_MENU
+                self._replay_back_to_cats()
                 return
             # 删除按钮
             if hasattr(self, '_replay_sel_delete_rect') and self._replay_sel_delete_rect.collidepoint(mp):
