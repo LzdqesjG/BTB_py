@@ -421,9 +421,9 @@ class Game:
         self._ai_anim_timer = 0          # 动画计时
         self._AI_ANIM_FRAMES = 40        # 决策后候选动画帧数 (~0.67s)
         self._ai_planner = None          # 迭代规划器实例（思考期间）
-        self._ai_think_target = 0        # 当前思考目标帧数（基础 2s / 上限 5s）
-        # 思考时长：基础 2 秒（兼容设置里调大的值），复杂局面 AI 可延长至上限 5 秒
-        self._AI_THINK_BASE_FRAMES = max(self._AI_THINK_DELAY, int(self.fps * 2.0))
+        self._ai_think_target = 0        # 当前思考目标帧数（基础 = 配置延迟，上限 5s）
+        # 思考时长：基础直接取当前 _AI_THINK_DELAY（用户可配置，对弈/快进为 0 时立即决策），
+        # 仅当 AI 认为局面复杂（need_more）时才延长到上限 5 秒。
         self._AI_THINK_MAX_FRAMES = int(self.fps * 5.0)
 
         # 回放记录器
@@ -1838,7 +1838,7 @@ class Game:
                                     True, (180, 140, 60))
         elif self._ai_mode and (self.current_team == self._ai_team
                               or (self._ai_custody and self.current_team == self.my_team)):
-            target = self._ai_think_target if self._ai_think_target > 0 else self._AI_THINK_BASE_FRAMES
+            target = self._ai_think_target if self._ai_think_target > 0 else max(1, self._AI_THINK_DELAY)
             pct = int(self._ai_think_timer / max(1, target) * 100)
             progress_label = f"AI 思考中... ({pct}%)" if self._ai_think_timer > 0 else "AI 思考中..."
             hint = font_tiny.render(progress_label, True, (200, 160, 60))
@@ -2711,8 +2711,13 @@ class Game:
         # 常规落子：进入迭代规划
         self._ai_planner = ai
         self._ai_debug_candidates = viz
-        # 思考目标帧数：基础 2 秒；AI 认为需要更久时延长至 5 秒
-        self._ai_think_target = self._AI_THINK_MAX_FRAMES if need_more else self._AI_THINK_BASE_FRAMES
+        # 思考目标帧数：基础直接取当前 _AI_THINK_DELAY（对弈/快进为 0 时立即决策）；
+        # AI 认为需要更久时延长至 5 秒上限（对弈训练模式除外，始终立即决策保持快进）
+        base = max(0, self._AI_THINK_DELAY)
+        if self._ai_vs_ai:
+            self._ai_think_target = 0
+        else:
+            self._ai_think_target = self._AI_THINK_MAX_FRAMES if need_more else base
 
     def _execute_ai_action(self, action):
         """执行 AI 决策的动作（选点动画结束后调用）。"""

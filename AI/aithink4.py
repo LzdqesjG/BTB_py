@@ -1738,7 +1738,10 @@ class AIThinker:
         self.observe_opponent(game.nodes)
         key = (game.turn_count, game.current_team)
         if self.mem.get('turn_key') != key:
-            for k in ('reinforce_done', 'last_target', 'stall_turns'):
+            # 回合级重置：仅清理本回合临时标记。
+            # 注意：last_target / last_parent_id 必须跨回合保留——
+            # similar_turns 破局机制依赖它们判断"与上次落子极度相似"。
+            for k in ('reinforce_done', 'stall_turns'):
                 self.mem.pop(k, None)
             self.mem['turn_key'] = key
         self.sit = self.analyze_situation()
@@ -1814,13 +1817,30 @@ class AIThinker:
         # 时间由 main 控制：循环精化直到思考时长耗尽
         return False, self._plan_viz()
 
+    def _record_similar_turns(self, parent, tx, ty):
+        """记录落子并更新重复路线计数（similar_turns）。
+
+        与上次操作"极度相似"（同一父节点 + 目标点高度重合 <60px）→ 计数+1，
+        否则重置为 1。供 best_placement 与 finish_plan 共用，
+        保证迭代规划路径与旧路径的破局机制一致。
+        """
+        prev_t = self.mem.get('last_target')
+        prev_p = self.mem.get('last_parent_id')
+        same_parent = (prev_p is not None and parent.id == prev_p)
+        if prev_t is not None and same_parent and _dist(tx, ty, prev_t[0], prev_t[1]) < 60.0:
+            self.mem['similar_turns'] = self.mem.get('similar_turns', 0) + 1
+        else:
+            self.mem['similar_turns'] = 1  # 路线变化则重置
+        self.mem['last_target'] = (tx, ty)
+        self.mem['last_parent_id'] = parent.id
+
     def finish_plan(self):
         """返回最终最优动作（精化后的 top1）。"""
         if not self._plan_all:
             return self._plan_fallback
         best = self._plan_all[0]
         self.last_cands = self._plan_viz()
-        self.mem['last_target'] = (best[2][0], best[2][1])
+        self._record_similar_turns(best[1], best[2][0], best[2][1])
         self._remember_placement(best[2][0], best[2][1])
         self.mem['last_placed_en'] = self.sit.en_nodes
         self.mem['stall_turns'] = 0
@@ -1845,15 +1865,7 @@ class AIThinker:
 
         best = all_cands[0]
         # 换路线检测: 与上次操作"极度相似"(同一父节点 + 目标点高度重合) → 重复计数+1
-        prev_t = self.mem.get('last_target')
-        prev_p = self.mem.get('last_parent_id')
-        same_parent = (prev_p is not None and best[1].id == prev_p)
-        if prev_t is not None and same_parent and _dist(best[2][0], best[2][1], prev_t[0], prev_t[1]) < 60.0:
-            self.mem['similar_turns'] = self.mem.get('similar_turns', 0) + 1
-        else:
-            self.mem['similar_turns'] = 1  # 路线变化则重置
-        self.mem['last_target'] = (best[2][0], best[2][1])
-        self.mem['last_parent_id'] = best[1].id
+        self._record_similar_turns(best[1], best[2][0], best[2][1])
         # 收集 top 候选用于可视化 (含威胁惩罚/模拟后的最终分数)
         self.last_cands = []
         for sc, n, t, str_, ri in all_cands[:12]:
@@ -1984,9 +1996,10 @@ class AIThinker:
         self.observe_opponent(game.nodes)
 
         # 回合级记忆重置 (last_placed 已由 _update_memory 消费; 不重置 last_placed_en/no_progress)
+        # 注意：last_target / last_parent_id 跨回合保留，供 similar_turns 破局机制使用
         key = (game.turn_count, game.current_team)
         if self.mem.get('turn_key') != key:
-            for k in ('reinforce_done', 'last_target', 'stall_turns'):
+            for k in ('reinforce_done', 'stall_turns'):
                 self.mem.pop(k, None)
             self.mem['turn_key'] = key
 
