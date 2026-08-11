@@ -418,6 +418,14 @@ class Game:
         self._idle_played_key = None  # 已播放过 idle 的回合标识
         self._resume_from_replay = False
         self._ai_learned = False      # 本局 AI 是否已完成学习记录（只记一次）
+        # AI 对弈训练局数统计：本进程会话内局数（内存）+ 历史总局数（持久化到 ai.json stats）
+        self._ai_vs_ai_session_games = 0   # 本次启动会话内已完成的训练局数
+        self._ai_vs_ai_total_games = 0     # 历史累计训练局数（跨启动沿用）
+        try:
+            from AI.aithink4 import _load_stats
+            self._ai_vs_ai_total_games = int(_load_stats().get('ai_vs_ai_total_games', 0) or 0)
+        except Exception:
+            self._ai_vs_ai_total_games = 0
         # AI 选点动态可视化 / 迭代规划
         self._ai_pending_action = None   # 已决策待执行的 AI 动作（先播动画）
         self._ai_anim_timer = 0          # 动画计时
@@ -470,6 +478,15 @@ class Game:
         self._ai_post_reinforce = 0
         self._idle_played_key = None
         self._ai_learned = False      # 新对局重置 AI 学习标志
+        # 清理 AI 运行时状态，防止上一局残留的规划器/待执行动作带入新局：
+        # 曾出现 AI 对弈中途退出后再进入，_ai_update 沿用上一局的旧 parent 节点
+        # 创建新节点 → 跨队连线。必须全部重置。
+        self._ai_pending_action = None
+        self._ai_planner = None
+        self._ai_anim_timer = 0
+        self._ai_think_timer = 0
+        self._ai_think_target = 0
+        self._ai_debug_candidates = []
         # 创建根节点：红左上，蓝右下
         red_root = Node('RED', 120, 120, strength=1)
         blue_root = Node('BLUE', SCREEN_WIDTH - 120, SCREEN_HEIGHT - 120, strength=1)
@@ -811,12 +828,22 @@ class Game:
                 fname = self.replay.save()
                 if fname:
                     add_debug_log(f"Replay saved: {fname}", (-1, -1, -1), 3000)
-                # AI 对弈模式：记录学习数据并微调权重，随后自动重开下一局
+                # AI 对弈模式：记录学习数据并微调权重，统计训练局数，随后自动重开下一局
                 if self._ai_vs_ai:
                     try:
                         self._record_ai_learn('RED')
                     except Exception as e:
                         print(f"[AI学习] 对弈记录失败: {e}")
+                    # 训练局数统计：本次会话局数（内存）+ 历史总局数（写回 ai.json stats）
+                    self._ai_vs_ai_session_games += 1
+                    self._ai_vs_ai_total_games += 1
+                    try:
+                        from AI.aithink4 import _save_stats, _load_stats
+                        stats = _load_stats()
+                        stats['ai_vs_ai_total_games'] = self._ai_vs_ai_total_games
+                        _save_stats(stats)
+                    except Exception as e:
+                        print(f"[AI学习] 局数保存失败: {e}")
                     self.start_ai_vs_ai_game()
             return
 
@@ -1835,8 +1862,11 @@ class Game:
 
         # 底部提示
         if self._ai_vs_ai:
-            hint = font_tiny.render("AI 对弈中...（双 AI 自动对局，一方胜出自动重开并保存回放）",
-                                    True, (180, 140, 60))
+            session = self._ai_vs_ai_session_games
+            total = self._ai_vs_ai_total_games
+            hint = font_tiny.render(
+                f"AI 对弈中...（已训练 {session} 局 / 历史共 {total} 局，一方胜出自动重开并保存回放）",
+                True, (180, 140, 60))
         elif self._ai_mode and (self.current_team == self._ai_team
                               or (self._ai_custody and self.current_team == self.my_team)):
             target = self._ai_think_target if self._ai_think_target > 0 else max(1, self._AI_THINK_DELAY)

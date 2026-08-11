@@ -101,14 +101,61 @@ def backup_weights():
 
 
 def save_weights(cfg):
-    """把 AIConfig 的全部权重写回 ai.json。写前自动备份旧文件，tmp+rename 原子写。"""
+    """把 AIConfig 的全部权重写回 ai.json。写前自动备份旧文件，tmp+rename 原子写。
+
+    保留 ai.json 中非权重字段（如 stats 统计），避免被权重覆盖丢失。
+    """
     backup_weights()
     tmp = _AI_JSON + '.tmp'
     try:
+        data = cfg.to_dict()
+        st = _load_stats()
+        if st:
+            data['stats'] = st   # 保留非权重统计字段（嵌套在 stats 下，不展开）
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(cfg.to_dict(), f, indent=2, ensure_ascii=False)
+            json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, _AI_JSON)
         _reload_override()  # 本进程内立即生效
+        return True
+    except Exception:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+# ===== AI 对弈统计 (ai.json 的 stats 字段, 非权重数据) =====
+
+def _load_stats():
+    """读取 ai.json 中的 stats 统计字段；文件缺失/解析失败返回空 dict。"""
+    if not os.path.isfile(_AI_JSON):
+        return {}
+    try:
+        with open(_AI_JSON, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        s = data.get('stats')
+        return s if isinstance(s, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_stats(stats):
+    """把 stats 统计字段合并写回 ai.json（保留所有权重字段），原子写。"""
+    data = {}
+    if os.path.isfile(_AI_JSON):
+        try:
+            with open(_AI_JSON, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data['stats'] = stats
+    tmp = _AI_JSON + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, _AI_JSON)
         return True
     except Exception:
         try:
