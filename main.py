@@ -2387,6 +2387,19 @@ class Game:
             self._snap_enabled = not self._snap_enabled
             play_sfx('click')
 
+        # DEBUG(KEY_S_TO_SAVE): 任意对局模式下按 S 直接保存回放到 replays/debug/
+        if (event.type == pygame.KEYDOWN and event.key == pygame.K_s
+                and 'KEY_S_TO_SAVE' in DEBUGS):
+            try:
+                if not self.replay.actions:
+                    print("[DebugReplay] 无操作可保存，忽略")
+                else:
+                    path = self.replay.save_to('debug')
+                    add_debug_log(f"DebugReplay 已保存: {os.path.basename(path)}",
+                                  (120, 255, 120), 2500)
+            except Exception as e:
+                print(f"[DebugReplay] 保存失败: {e}")
+
         if not is_my_turn:
             return  # 等待对方操作
 

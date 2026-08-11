@@ -55,3 +55,18 @@ class ReplayRecorder:
                 f.write(json.dumps(action, ensure_ascii=False) + '\n')
         print(f"[Replay] 已保存: {path}  ({len(self.actions)} 步)")
         return path
+
+    def save_to(self, subdir):
+        """把当前记录保存到 replays/<subdir>/ 时间戳.bpr（调试用额外副本）。
+
+        不改变 _saved 状态：不影响对局结束时的正常自动保存。
+        """
+        replay_dir = os.path.join(os.path.dirname(__file__), 'replays', subdir)
+        os.makedirs(replay_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(replay_dir, f"{ts}.bpr")
+        with open(path, 'w', encoding='utf-8') as f:
+            for action in self.actions:
+                f.write(json.dumps(action, ensure_ascii=False) + '\n')
+        print(f"[Replay] 已保存: {path}  ({len(self.actions)} 步)")
+        return path

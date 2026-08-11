@@ -1815,23 +1815,42 @@ class AIThinker:
         # 时间由 main 控制：循环精化直到思考时长耗尽
         return False, self._plan_viz()
 
+    def _update_similar_turns(self, tx, ty, parent_id):
+        """更新重复路线计数：与上次操作"极度相似"(同父节点 + 目标 <60px) → +1，否则重置。
+
+        所有产生 place_node 的决策出口统一调用（planner / 绝望兜底 / 紧急拾取），
+        避免死循环检测只在 planner 路径生效、其他路径无限重复同一落点。
+        返回当前计数。
+        """
+        mem = self.mem
+        prev_t = mem.get('last_target')
+        prev_p = mem.get('last_parent_id')
+        same_parent = (prev_p is not None and parent_id == prev_p)
+        if prev_t is not None and same_parent and _dist(tx, ty, prev_t[0], prev_t[1]) < 60.0:
+            mem['similar_turns'] = mem.get('similar_turns', 0) + 1
+        else:
+            mem['similar_turns'] = 1  # 路线变化则重置
+        mem['last_target'] = (tx, ty)
+        mem['last_parent_id'] = parent_id
+        return mem['similar_turns']
+
+    def _in_repeat_zone(self, tx, ty):
+        """similar_turns≥3 时，目标是否落在上次落点重复区域内（该区域已被重罚/需要绕开）。"""
+        mem = self.mem
+        if mem.get('similar_turns', 0) < 3:
+            return False
+        last = mem.get('last_target')
+        if last is None:
+            return False
+        return _dist(tx, ty, last[0], last[1]) < 120
+
     def finish_plan(self):
         """返回最终最优动作（精化后的 top1）。"""
         if not self._plan_all:
             return self._plan_fallback
         best = self._plan_all[0]
         self.last_cands = self._plan_viz()
-        # 换路线检测: 与上次操作"极度相似"(同一父节点 + 目标点高度重合) → 重复计数+1
-        # （与 best_placement 尾部一致；planner 路径下 last_target 已跨回合保留）
-        prev_t = self.mem.get('last_target')
-        prev_p = self.mem.get('last_parent_id')
-        same_parent = (prev_p is not None and best[1].id == prev_p)
-        if prev_t is not None and same_parent and _dist(best[2][0], best[2][1], prev_t[0], prev_t[1]) < 60.0:
-            self.mem['similar_turns'] = self.mem.get('similar_turns', 0) + 1
-        else:
-            self.mem['similar_turns'] = 1  # 路线变化则重置
-        self.mem['last_target'] = (best[2][0], best[2][1])
-        self.mem['last_parent_id'] = best[1].id
+        self._update_similar_turns(best[2][0], best[2][1], best[1].id)
         self._remember_placement(best[2][0], best[2][1])
         self.mem['last_placed_en'] = self.sit.en_nodes
         self.mem['stall_turns'] = 0
@@ -1855,16 +1874,8 @@ class AIThinker:
             all_cands.sort(key=lambda c: -c[0])
 
         best = all_cands[0]
-        # 换路线检测: 与上次操作"极度相似"(同一父节点 + 目标点高度重合) → 重复计数+1
-        prev_t = self.mem.get('last_target')
-        prev_p = self.mem.get('last_parent_id')
-        same_parent = (prev_p is not None and best[1].id == prev_p)
-        if prev_t is not None and same_parent and _dist(best[2][0], best[2][1], prev_t[0], prev_t[1]) < 60.0:
-            self.mem['similar_turns'] = self.mem.get('similar_turns', 0) + 1
-        else:
-            self.mem['similar_turns'] = 1  # 路线变化则重置
-        self.mem['last_target'] = (best[2][0], best[2][1])
-        self.mem['last_parent_id'] = best[1].id
+        # 换路线检测（与 finish_plan/desperate/emergency 共用统一逻辑）
+        self._update_similar_turns(best[2][0], best[2][1], best[1].id)
         # 收集 top 候选用于可视化 (含威胁惩罚/模拟后的最终分数)
         self.last_cands = []
         for sc, n, t, str_, ri in all_cands[:12]:
@@ -1911,6 +1922,9 @@ class AIThinker:
                         break
                 if not ok:
                     continue
+                # 重复路线破局: 连续 ≥3 回合落同一区域 → 绕开该区域，强制换线
+                if self._in_repeat_zone(tx, ty):
+                    continue
                 # 优先能捡到点数包的落点
                 score = -d * 0.05
                 for sp in pickups:
@@ -1926,6 +1940,7 @@ class AIThinker:
         if best is not None:
             self.last_cands = [(best['parent'], best['x'], best['y'],
                                 best['strength'], best['range_index'], best_score)]
+            self._update_similar_turns(best['x'], best['y'], best['parent'].id)
             self._remember_placement(best['x'], best['y'])
             self.mem['last_placed_en'] = self.sit.en_nodes
         return best
@@ -1956,6 +1971,9 @@ class AIThinker:
                     continue
                 if self._occupied(tx, ty, nodes, n):
                     continue
+                # 重复路线破局: 连续 ≥3 回合捡同一区域 → 换别的包/交给常规路径
+                if self._in_repeat_zone(tx, ty):
+                    continue
                 # 朝敌根方向加分 (避免为捡包大幅绕路)
                 v1x = en_root.x - n.x
                 v1y = en_root.y - n.y
@@ -1970,6 +1988,7 @@ class AIThinker:
         if best is not None:
             self.last_cands = [(best['parent'], best['x'], best['y'],
                                 best['strength'], best['range_index'], best_score)]
+            self._update_similar_turns(best['x'], best['y'], best['parent'].id)
         return best
 
     # ============================================================

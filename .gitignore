@@ -14,6 +14,7 @@ logs/
 
 # Test files
 tests/
+_*.*
 
 # Replay files
 replays/*
