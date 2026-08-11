@@ -2,7 +2,9 @@
 # 可用的调试选项:
 # SOUNDS_DISABLED  -  不播放游戏音效
 # SHOW_DEBUG_INFO  -  在左下角显示调试信息
+# PRINT_DEBUG_INFO -  将调试信息作为日志打印
 # KEY_S_TO_SAVE    -  任意对局模式下按 S 直接保存回放到 replays/debug/
 
 SHOW_DEBUG_INFO
 KEY_S_TO_SAVE
+PRINT_DEBUG_INFO

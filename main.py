@@ -93,15 +93,16 @@ def add_debug_log(text, color=(-1, -1, -1), duration_ms=None):
     - color: RGB 元组
     - duration_ms: 显示时长(ms)，默认 2000
     """
-    if color == (-1, -1, -1):
-        color = randcolor("noblack")
     if not DEBUG_MODE:
         return
+    if color == (-1, -1, -1):
+        color = randcolor("noblack")
     texter = f"[DEBUG] {text}"
     tick = pygame.time.get_ticks()
     dur = duration_ms if duration_ms is not None else DEFAULT_DEBUG_DURATION
     _debug_entries.append((texter, color, tick, dur))
-    log.debug(text)
+    if "PRINT_DEBUG_INFO" in DEBUGS:
+        log.debug(text)
 
 # log.addHandler(add_debug_log)
 
