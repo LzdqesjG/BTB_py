@@ -1,10 +1,25 @@
 # Issue 列表（由 GitHub Actions 自动生成，请勿手动编辑）
 
-> 每次 Issue 变更（打开/编辑/关闭等）自动更新。运行时间：2026-08-11 02:24:59 UTC
+> 每次 Issue 变更（打开/编辑/关闭等）自动更新。运行时间：2026-08-11 02:26:25 UTC
 
 ---
 
-当前 Open Issue 数量：**5**
+当前 Open Issue 数量：**6**
+
+## #27 打开回放页面，进入删除模式，手动把文件删了，按确认删除，后还在删除模式 应该退出(因为已经删除完成)
+
+| 字段 | 值 |
+| --- | --- |
+| 状态 | OPEN |
+| 作者 | huxinchi |
+| 创建时间 | 2026-08-11T02:26:19Z |
+| 标签 |  |
+
+### 内容
+
+
+
+---
 
 ## #26 打开回放页面，删除掉回放文件，在尝试播放的时候会报错FileNotFoundError: [Errno 2] No such file or directory: '/data/data/com.termux/files/home/python-dev/BTB_py/replays/20260811_101812.bpr'
 
