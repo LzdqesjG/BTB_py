@@ -411,6 +411,7 @@ class Game:
         self._ai_post_reinforce = 0   # 本回合放置后已强化的次数
         self._idle_played_key = None  # 已播放过 idle 的回合标识
         self._resume_from_replay = False
+        self._ai_learned = False      # 本局 AI 是否已完成学习记录（只记一次）
         # AI 选点动态可视化
         self._ai_pending_action = None   # 已决策待执行的 AI 动作（先播动画）
         self._ai_anim_timer = 0          # 动画计时
@@ -450,6 +451,7 @@ class Game:
         self._ai_memory = {}  # 每局重置 AI 记忆
         self._ai_post_reinforce = 0
         self._idle_played_key = None
+        self._ai_learned = False      # 新对局重置 AI 学习标志
         # 创建根节点：红左上，蓝右下
         red_root = Node('RED', 120, 120, strength=1)
         blue_root = Node('BLUE', SCREEN_WIDTH - 120, SCREEN_HEIGHT - 120, strength=1)
@@ -507,6 +509,13 @@ class Game:
 
     def go_menu(self):
         """返回菜单，清理网络资源。"""
+        # AI 自动学习：AI 对局结束（含中途退出）返回菜单时记录本局结果并微调权重
+        if self._ai_mode and self._ai_team and not self._ai_learned:
+            try:
+                self._record_ai_learn()
+            except Exception as e:
+                print(f"[AI学习] 失败: {e}")
+            self._ai_learned = True
         if self.net_server:
             self.net_server.stop()
             self.net_server = None
@@ -520,6 +529,26 @@ class Game:
         self.ip_input = ''
         self.connect_error = None
         self.state = STATE_MENU
+
+    def _record_ai_learn(self):
+        """记录本局 AI 学习数据（对局结果 + 对手打法），微调权重写回 ai.json。
+
+        在 go_menu() 返回菜单时调用，一局只记一次。
+        """
+        from AI.aithink4 import AIThinker
+        ai = AIThinker(self)
+        ai.observe_opponent(self.nodes)
+        if self.winner is None:
+            result = 'draw'  # 中途退出，只统计不调整权重
+        else:
+            result = 'win' if self.winner == ai.team else 'loss'
+        ai.record_match_result(
+            result=result,
+            reason=self.winner or 'aborted',
+            turns=self.turn_count,
+        )
+        label = {'win': '胜', 'loss': '负', 'draw': '平'}[result]
+        print(f"[AI学习] 记录本局结果: {label} (回合 {self.turn_count}), 权重已更新并备份")
 
     # ===== 联机动作系统 =====
 

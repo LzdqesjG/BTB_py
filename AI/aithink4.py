@@ -48,6 +48,7 @@ import json
 import math
 import os
 import random
+import shutil
 
 from constant import (
     SCREEN_WIDTH, SCREEN_HEIGHT, PLAY_AREA_TOP, PLAY_MARGIN,
@@ -58,6 +59,8 @@ from constant import (
 # 运行时参数覆盖: 若存在 AI/ai.json, 加载并覆盖 AIConfig 默认值 (便于调参)。
 # 该文件由 dev/rl_evolve.py 的进化式强化训练生成。
 _AI_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ai.json')
+_LEARN_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'learn.json')
+_BACKUP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'backup')
 _JSON_OVERRIDE = {}
 if os.path.isfile(_AI_JSON):
     try:
@@ -65,6 +68,72 @@ if os.path.isfile(_AI_JSON):
             _JSON_OVERRIDE = json.load(_fh)
     except Exception:
         _JSON_OVERRIDE = {}
+
+
+# ===== 权重文件读写 / 备份 / 学习数据 (AI 自动学习基础设施) =====
+
+def _now_tag():
+    from datetime import datetime
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def backup_weights():
+    """把当前 ai.json 备份到 AI/backup/ai_<日期时间戳>.json（按日期保留历史，写前自动调用）。"""
+    if not os.path.isfile(_AI_JSON):
+        return None
+    try:
+        os.makedirs(_BACKUP_DIR, exist_ok=True)
+        dst = os.path.join(_BACKUP_DIR, f'ai_{_now_tag()}.json')
+        shutil.copy2(_AI_JSON, dst)
+        return dst
+    except Exception:
+        return None
+
+
+def save_weights(cfg):
+    """把 AIConfig 的全部权重写回 ai.json。写前自动备份旧文件，tmp+rename 原子写。"""
+    backup_weights()
+    tmp = _AI_JSON + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cfg.to_dict(), f, indent=2, ensure_ascii=False)
+        os.replace(tmp, _AI_JSON)
+        return True
+    except Exception:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
+
+
+def _load_learn():
+    """读取 AI/learn.json（学习统计与对局记录）。"""
+    if os.path.isfile(_LEARN_JSON):
+        try:
+            with open(_LEARN_JSON, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_learn(data):
+    """原子写入 AI/learn.json。"""
+    tmp = _LEARN_JSON + '.tmp'
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, _LEARN_JSON)
+        return True
+    except Exception:
+        try:
+            if os.path.isfile(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
 
 # ============================================================
 # 常量 (由游戏常量推导, 保证与 anti_cheat / main 完全一致)
@@ -201,6 +270,39 @@ class AIConfig:
                     setattr(self, _k, float(_v))
                 except (TypeError, ValueError):
                     pass
+        self._apply_clip()
+
+    # ===== 权重边界（自动学习微调后夹取，防止失控） =====
+    _CLIP = {
+        'node_hit': (200, 5000), 'hub_factor': (100, 2500),
+        'edge_kill': (10, 400), 'edge_hit': (5, 300),
+        'decisive2': (20, 800), 'combo': (5, 200),
+        'str_bonus': (5, 120), 'advance': (1, 40),
+        'collect': (50, 1500), 'collect_low': (10, 350),
+        'expand': (0.0, 2.0), 'center': (0.0, 1.0),
+        'defense': (0.0, 10.0),
+        'reserve_base': (0.5, 8.0),
+        'spend_open': (5, 90), 'spend_mid': (2, 55),
+        'spend_tight': (1, 35), 'extra_thresh': (100, 1000),
+        'threat_mul': (0.6, 3.0),
+        'reinf_budget': (0.1, 0.9), 'reinf_threat': (5, 60),
+        'sprint_dist': (100, 500), 'sprint_bonus': (0.5, 4.0),
+        'extra_sprint': (80, 500), 'deep_push': (200, 700),
+        'hub_preference': (0.5, 3.0), 'risk_taker': (0.4, 2.5),
+        'chain_bonus': (1, 30), 'advance_cap': (50, 500),
+        'max_move_cost': (0, 8),
+    }
+
+    def to_dict(self):
+        """导出全部权重字段为 dict（用于写回 ai.json）。"""
+        return {k: getattr(self, k) for k in AIConfig._CLIP}
+
+    def _apply_clip(self):
+        """把所有权重夹到合理范围内（加载或微调后调用）。"""
+        for k, (lo, hi) in AIConfig._CLIP.items():
+            v = getattr(self, k, None)
+            if v is not None:
+                setattr(self, k, max(lo, min(hi, float(v))))
 
 
 # ============================================================
@@ -368,6 +470,97 @@ class AIThinker:
         mp.append((x, y))
         if len(mp) > 24:
             mp.pop(0)
+
+    # ---------- 对手行为统计 (自动学习) ----------
+    def observe_opponent(self, nodes):
+        """统计对手打法偏好，写入跨回合记忆（供对局结束学习使用）。
+
+        指标:
+        - long_dist / total: 敌方非根节点中父距离 >160px 的比例（长距离落子习惯）
+        - strong / total: 敌方节点强度 >1 的比例（强化习惯）
+        """
+        mem = self.mem
+        os_ = mem.setdefault('opp_stats',
+                             {'long_dist': 0, 'total': 0, 'strong': 0})
+        total = 0
+        long_dist = 0
+        strong = 0
+        for n in nodes:
+            if n.team != self.enemy_team or n.parent is None:
+                continue
+            total += 1
+            if math.hypot(n.x - n.parent.x, n.y - n.parent.y) > 160:
+                long_dist += 1
+            if n.strength > 1:
+                strong += 1
+        os_['long_dist'] = long_dist
+        os_['total'] = total
+        os_['strong'] = strong
+
+    def record_match_result(self, result, reason='', turns=0):
+        """对局结束自动学习：更新 learn.json，按结果微调权重并写回 ai.json。
+
+        参数:
+        - result: 'win' / 'loss' / 'draw'（draw = 中途退出未分胜负，只记录不调权重）
+        触发时机: 单人 AI 对局结束返回菜单时 (main.go_menu)。
+        - 连续失败 (>=3) → 保守化: 降冒险/花费/枢纽偏好, 升威胁感知与防守收集。
+        - 连续胜利 (>=3) → 轻微恢复激进。
+        - 权重写回前自动把旧 ai.json 按日期备份到 AI/backup/。
+        """
+        learn = _load_learn()
+        learn['wins'] = learn.get('wins', 0) + (1 if result == 'win' else 0)
+        learn['losses'] = learn.get('losses', 0) + (1 if result == 'loss' else 0)
+        learn['draws'] = learn.get('draws', 0) + (1 if result == 'draw' else 0)
+        learn['total_games'] = learn.get('total_games', 0) + 1
+
+        rec = {
+            't': _now_tag(),
+            'result': result,
+            'turns': turns,
+            'reason': reason or '',
+        }
+        os_ = self.mem.get('opp_stats', {})
+        if os_ and os_.get('total'):
+            rec['enemy_style'] = {
+                'long_range_ratio': round(os_['long_dist'] / os_['total'], 2),
+                'reinforce_ratio': round(os_['strong'] / os_['total'], 2),
+            }
+        learn.setdefault('recent', []).append(rec)
+        learn['recent'] = learn['recent'][-20:]
+
+        # ---- 依据最近连败/连胜微调权重 (平局只统计不调整) ----
+        cfg = self.cfg
+        if result in ('win', 'loss'):
+            win = (result == 'win')
+            streak = 0
+            for r in reversed(learn['recent']):
+                if (r['result'] == 'win') == win:
+                    streak += 1
+                else:
+                    break
+            if not win and streak >= 3:
+                cfg.risk_taker *= 0.90          # 降低冒险度
+                cfg.spend_mid *= 0.95           # 花费更保守
+                cfg.hub_preference *= 0.95      # 减少高风险枢纽击杀
+                cfg.threat_mul *= 1.06          # 提升威胁感知
+                cfg.collect_low *= 1.10         # 更积极收集保点数
+                learn['last_adjust'] = 'conservative'
+            elif win and streak >= 3:
+                cfg.risk_taker *= 1.05          # 小幅恢复冒险
+                cfg.spend_mid *= 1.03
+                cfg.threat_mul *= 0.98
+                learn['last_adjust'] = 'aggressive'
+
+        # ---- 对手行为应对：对手爱强化 → 提高威胁感知 ----
+        if os_ and os_.get('total'):
+            reinf = os_['strong'] / os_['total']
+            if reinf > 0.5:
+                cfg.threat_mul = min(3.0, cfg.threat_mul * 1.03)
+
+        cfg._apply_clip()
+        save_weights(cfg)
+        _save_learn(learn)
+        return learn
 
     # ---------- 根节点查找 ----------
     def _find_roots(self):
@@ -1613,6 +1806,8 @@ class AIThinker:
 
         # 检查上次落点是否被摧毁 (打地鼠记忆) — 必须在回合重置前, 否则 last_placed 会被清掉
         self._update_memory(game.nodes)
+        # 统计对手打法偏好 (供对局结束自动学习)
+        self.observe_opponent(game.nodes)
 
         # 回合级记忆重置 (last_placed 已由 _update_memory 消费; 不重置 last_placed_en/no_progress)
         key = (game.turn_count, game.current_team)
