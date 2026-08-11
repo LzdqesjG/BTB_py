@@ -426,6 +426,11 @@ class Game:
             self._ai_vs_ai_total_games = int(_load_stats().get('ai_vs_ai_total_games', 0) or 0)
         except Exception:
             self._ai_vs_ai_total_games = 0
+        # AI 对弈平均速度统计：每秒（self.fps 帧）两个 AI 合计执行的轮数（每 end_turn 一轮）
+        self._ai_speed_current = 0     # 当前 1 秒窗口内已结束的轮数
+        self._ai_speed_frames = 0      # 当前窗口已走帧数
+        self._ai_speed_history = []    # 最近 10 秒的轮数，用于平滑平均
+        self._ai_speed_avg = 0.0       # 显示用平均速度（轮/秒）
         # AI 选点动态可视化 / 迭代规划
         self._ai_pending_action = None   # 已决策待执行的 AI 动作（先播动画）
         self._ai_anim_timer = 0          # 动画计时
@@ -879,6 +884,19 @@ class Game:
             if self._idle_played_key != key:
                 self._idle_played_key = key
                 play_sfx('turn')
+
+        # AI 对弈平均速度统计：每 self.fps 帧（=1 秒，按配置帧数计）结算一次窗口轮数
+        if self._ai_vs_ai:
+            self._ai_speed_frames += 1
+            fps = max(1, int(self.fps))
+            if self._ai_speed_frames >= fps:
+                self._ai_speed_frames = 0
+                self._ai_speed_history.append(self._ai_speed_current)
+                self._ai_speed_current = 0
+                if len(self._ai_speed_history) > 10:
+                    self._ai_speed_history.pop(0)
+                self._ai_speed_avg = (sum(self._ai_speed_history)
+                                      / len(self._ai_speed_history))
 
         # 客户端不执行碰撞检测和交叉结算（由服务器处理）
         for pack in self.pickups:
@@ -1803,7 +1821,12 @@ class Game:
         pygame.draw.rect(surface, turn_color, hud_turn, 2, border_radius=6)
         tt = font_mid.render(f"第 {self.turn_count} 回合", True, WHITE)
         surface.blit(tt, tt.get_rect(center=(hud_turn.centerx, hud_turn.y + 18)))
-        ttt = font_small.render(f"当前: {turn_name} 行动", True, turn_color)
+        if self._ai_vs_ai:
+            # AI 对弈：显示平均速度（每秒对弈回合数 = 每秒 end_turn 数 ÷ 2，两位小数）
+            speed_txt = f"平均速度: {self._ai_speed_avg / 2:.2f} 回合/秒"
+            ttt = font_small.render(speed_txt, True, turn_color)
+        else:
+            ttt = font_small.render(f"当前: {turn_name} 行动", True, turn_color)
         surface.blit(ttt, ttt.get_rect(center=(hud_turn.centerx, hud_turn.y + 44)))
 
         # 退出按钮（回合面板下方）
@@ -3151,6 +3174,10 @@ class Game:
         self.hovered_branch_child = None
         self._ai_post_reinforce = 0    # 新回合重置
         self._ai_debug_candidates = []  # 清除 AI 候选可视化
+
+        # AI 对弈速度统计：每结束一回合（end_turn）计一轮
+        if self._ai_vs_ai:
+            self._ai_speed_current += 1
 
         # 回放：记录结束回合
         previous_team = self.current_team

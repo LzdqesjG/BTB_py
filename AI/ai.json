@@ -14,10 +14,10 @@
   "defense": 2.36,
   "reserve_base": 2.48,
   "spend_open": 27.32,
-  "spend_mid": 53.856888624,
+  "spend_mid": 55,
   "spend_tight": 7.9,
   "extra_thresh": 414.62,
-  "threat_mul": 3.0,
+  "threat_mul": 2.995544296507944,
   "reinf_budget": 0.42,
   "reinf_threat": 22.94,
   "sprint_dist": 275.78,
@@ -25,11 +25,11 @@
   "extra_sprint": 210.82,
   "deep_push": 420.0,
   "hub_preference": 0.5,
-  "risk_taker": 1.9321044955441968,
+  "risk_taker": 2.5,
   "chain_bonus": 8.05,
   "advance_cap": 160.0,
   "max_move_cost": 1.0,
   "stats": {
-    "ai_vs_ai_total_games": 517
+    "ai_vs_ai_total_games": 747
   }
 }
