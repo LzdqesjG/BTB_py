@@ -22,6 +22,7 @@
   - [game_client.py - 客户端](#game_clientpy---客户端)
   - [anti_cheat.py - 反作弊](#anti_cheatpy---反作弊)
   - [AI/aithink4.py - AI 系统](#aiaithink4py---ai-系统)
+  - [AI 自动学习](#ai-自动学习17)
   - [replay.py - 回放系统](#replaypy---回放系统)
 - [联机架构](#联机架构)
   - [网络拓扑](#网络拓扑)
@@ -93,10 +94,11 @@ python main.py
 BTB_py/
 ├── main.py                  # 游戏主入口、Node/Game 类、全量绘制和事件处理
 ├── constant.py              # 全局常量、颜色、音效配置、字体加载（从 config.json 读取）
-├── config.json              # 游戏基础配置（显示、玩法、AI 思考时间、点数包、端口）
+├── config.json              # 游戏基础配置（显示、玩法、AI 思考时间、点数包、端口；gitignore 排除）
+├── config.default.json      # 配置默认模板（提交到仓库，config.json 缺失时自动复制）
 ├── network_protocol.py      # 网络消息编解码、状态序列化/反序列化
-├── game_server.py           # 房主端 TCP 服务器（红方）
-├── game_client.py           # 客户端 TCP 连接（蓝方）
+├── game_server.py           # 房主端 TCP 服务器（红方，线程安全）
+├── game_client.py           # 客户端 TCP 连接（蓝方，线程安全）
 ├── anti_cheat.py            # 服务端反作弊校验
 ├── replay.py                # 对局回放录制器
 ├── requirements.txt         # Python 依赖
@@ -110,18 +112,22 @@ BTB_py/
 │   └── ai_default.json      # AI 默认参数（不可修改的初始版本）
 │
 ├── AI/
-│   ├── aithink4.py          # AI 决策引擎（当前生效版本，main.py 导入此模块）
+│   ├── aithink4.py          # AI 决策引擎（当前生效版本，含自动学习基础设施）
 │   ├── aithink3.py          # AI 旧版（被 aithink4 小幅调参迭代而来）
 │   ├── aithink2.py          # AI 旧版（早期移植版本）
 │   ├── aithink.py           # AI 旧版（最早移植版本）
-│   └── ai.json              # AI 运行时参数（为空时自动从 ai_default.json 复制）
+│   ├── ai.json              # AI 全部 30 个权重参数（运行时加载，自动学习会更新）
+│   ├── learn.json           # AI 学习数据（对局统计/对手打法，gitignore 排除，运行时生成）
+│   └── backup/              # ai.json 按日期自动备份（gitignore 排除）
 │
 ├── dev/
-│   └── dev.md               # 本文档
+│   ├── dev.md               # 本文档
+│   └── rl_evolve.py         # AI 自对弈训练器（变异权重锦标赛，择优写回 ai.json）
 │
 ├── .github/
 │   └── workflows/
-│       └── release-cd.yml   # GitHub Actions：打 tag 自动发布 ZIP Release
+│       ├── release-cd.yml   # GitHub Actions：打 tag 自动发布 ZIP Release
+│       └── issues-export.yml# GitHub Actions：Issue 变更时自动导出到 ISSUES.md
 │
 └── replays/                 # 对局回放文件（*.bpr, JSONL 格式）
 ```
@@ -432,12 +438,38 @@ while True:
 - `max_move_cost` 从 2 → **1**：常规落子只允许 0~1 点开销，强制免费短步推进，把点数留给杀根窗口（回放 204717/205605 教训）
 - 前线节点出生强度奖励：距离阈值 400 → **350**，每级奖励 60 → **120**：更贴近敌根才奖励，且出生即带强度，抵抗人类切强度 1 链
 
-**可配置参数**：全部通过 `assets/ai_default.json` 配置，运行时从 `AI/ai.json` 加载。修改 `ai.json` 后无需重启游戏即可生效（每局初始化时重新读取）。
+**可配置参数**：全部 **30 个权重**集中在 `AI/ai.json`（代码 `AIConfig.__init__` 只保留兜底默认值，运行时从 json 完整加载）。修改 `ai.json` 后每局初始化时自动生效。
 
 相关文件：
-- `AI/ai.json`：运行时配置，为空时自动从 `ai_default.json` 复制
-- `assets/ai_default.json`：出厂默认配置，含每个参数的注释说明
+- `AI/ai.json`：运行时权重（完整 30 字段，自动学习会更新，写前自动备份）
+- `AI/learn.json`：学习数据（对局统计/对手打法，gitignore 排除）
+- `AI/backup/`：ai.json 按日期自动备份（gitignore 排除）
 - `AI/aithink.py` / `AI/aithink2.py` / `AI/aithink3.py`：早期版本（未被 main.py 引用）
+
+### AI 自动学习（#17）
+
+AI 有三层学习能力，全部以 `AI/ai.json`（权重）和 `AI/learn.json`（统计）为存储：
+
+**1. 对局结果学习（每局结束自动触发）**
+- 触发链：`Game.go_menu()` → `_record_ai_learn()`（[main.py](main.py)）→ `AIThinker.record_match_result()`（[aithink4.py](AI/aithink4.py)）
+- 胜负判断：`winner == self._ai_team`；中途退出记为 `draw`（只统计、不调整权重）
+- 调整规则（依据最近 20 局连败/连胜）：
+  - **连败 ≥3** → 保守化：`risk_taker×0.90`、`spend_mid×0.95`、`hub_preference×0.95`、`threat_mul×1.06`、`collect_low×1.10`
+  - **连胜 ≥3** → 小幅恢复激进：`risk_taker×1.05`、`spend_mid×1.03`、`threat_mul×0.98`
+- 权重调整后经 `AIConfig._CLIP` 边界夹取（防止失控），写回 `ai.json`（tmp+rename 原子写），写前自动备份到 `AI/backup/ai_<时间戳>.json`
+
+**2. 对手行为统计**
+- `observe_opponent()`：AI 每回合统计敌方**长距离落子比例**（父距离 >160px）与**强化比例**（强度 >1）
+- 对手强化比例 >50% → 自动提升 `threat_mul`（更重视防守），并随对局结果记录进 `learn.json` 的 `enemy_style`
+
+**3. 在线自对弈训练（dev/rl_evolve.py）**
+- 在 dummy 视频驱动下跑 **AI vs AI 自对弈锦标赛**：以当前权重为基准，生成随机微扰权重（`--mutation`），交替先后手打 `--games` 局
+- 变异权重净胜更多 → 写回 `ai.json`（自动备份），否则保留
+- 与游戏内学习互补：游戏内按真实对局结果微调，脚本批量搜索更优权重组合
+
+```bash
+python dev/rl_evolve.py --games 8 --mutation 0.12 --seed 42
+```
 
 ### replay.py - 回放系统
 
@@ -693,8 +725,8 @@ print("也会进入日志文件")  # print 已被重定向
 | TCP 协议 | 文本协议简单但扩展性有限 | 考虑迁移到二进制协议或使用现成的消息库 |
 | 无认证 | 客户端无需认证即可连接 | 添加简易密码或 token 认证 |
 | 音效硬编码 | 音效文件路径和映射全部在 constant.py 中 | 可迁移到 config.json 或独立音效配置 |
-| AI 单模型 | AI 固定使用一套参数 | 增加多难度等级或多套参数预设 |
-| 设置按钮预留 | 菜单上"设置"按钮尚无功能 | 可添加音量、全屏、键位等设置 |
+| AI 单难度 | AI 只有一套权重（支持自动学习演化） | 增加多难度等级或多套参数预设 |
+| 自对弈需手动跑 | 游戏内只做结果学习，自对弈是独立脚本 | 可在空闲时自动触发有限自对弈 |
 
 ***
 
