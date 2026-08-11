@@ -2028,6 +2028,14 @@ class Game:
 
     # ===== 设置页 =====
 
+    # 设置页二级目录结构：一级分类 → [(key, 标签, 描述), ...]
+    _SETTINGS_CATS = [
+        ("显示", [("fps", "最高 FPS", "实时生效")]),
+        ("AI", [("ai_frames", "AI 思考时间", "上限 1.5s，实时生效"),
+                ("reset_ai", "重置 AI 参数", "点击确认恢复出厂权重")]),
+        ("网络", [("port", "默认端口", "下次建房/连接生效")]),
+    ]
+
     def _enter_settings(self):
         """进入设置页：从 config.json 读取当前值。"""
         import json
@@ -2045,52 +2053,173 @@ class Game:
         # AI 思考时间上限 1.5s
         max_frames = max(1, int(self._settings_fps * 1.5))
         self._settings_ai_frames = min(self._settings_ai_frames, max_frames)
-        self._settings_index = 0  # 0=FPS 1=AI思考时间 2=端口 3=重置AI参数
+        self._settings_cat = 0   # 一级目录索引
+        self._settings_index = 0  # 当前分类内的二级条目索引
         self._settings_notice = None  # 设置页临时提示 (text, tick)
+        # 鼠标交互矩形（每帧绘制时重建）
+        self._settings_cat_rects = []    # [(idx, rect), ...]
+        self._settings_item_rects = []   # [(key, rect, minus_rect, plus_rect), ...]
+        self._settings_back_rect = None
+        # 键盘键入编辑状态（端口 / AI 思考时间）
+        self._settings_editing = None    # 正在键入的条目 key，None=未编辑
+        self._settings_edit_text = ""    # 当前键入文本
+        self._settings_edit_cursor = 0   # 光标闪烁计时（绘制用）
         self.state = STATE_SETTINGS
+
+    def _current_setting_key(self):
+        """返回当前选中条目的 key。"""
+        try:
+            return self._SETTINGS_CATS[self._settings_cat][1][self._settings_index][0]
+        except IndexError:
+            return None
+
+    def _settings_move_item(self, delta):
+        """在二级条目间移动（delta=-1 上 / +1 下），跨分类循环。"""
+        cats = self._SETTINGS_CATS
+        cat, idx = self._settings_cat, self._settings_index
+        idx += delta
+        if idx < 0:
+            cat -= 1
+            if cat < 0:
+                cat = len(cats) - 1
+            idx = len(cats[cat][1]) - 1
+        elif idx >= len(cats[cat][1]):
+            cat += 1
+            if cat >= len(cats):
+                cat = 0
+            idx = 0
+        self._settings_cat = cat
+        self._settings_index = idx
+
+    def _settings_commit_edit(self):
+        """提交键盘键入：按条目类型解析并应用（非法输入则忽略）。"""
+        key = self._settings_editing
+        text = self._settings_edit_text.strip()
+        self._settings_editing = None
+        self._settings_edit_text = ""
+        if not text:
+            return
+        ok = False
+        if key == 'port':
+            try:
+                v = int(text)
+                if 1024 <= v <= 65535:
+                    self._settings_port = v
+                    ok = True
+            except ValueError:
+                pass
+        elif key == 'ai_frames':
+            try:
+                seconds = float(text)
+                if 0.05 <= seconds <= 1.5:
+                    self._settings_ai_frames = max(1, min(int(self._settings_fps * 1.5),
+                                                          round(seconds * self._settings_fps)))
+                    ok = True
+            except ValueError:
+                pass
+        if ok:
+            play_sfx('tap', strength=2)
+            self._apply_settings()
+        else:
+            play_sfx('heavy_hit')
 
     def _handle_settings_event(self, event):
         if event.type == pygame.QUIT:
             pygame.quit()
             sys.exit()
+
+        # ===== 键盘键入编辑模式（端口 / AI 思考时间） =====
+        if self._settings_editing is not None:
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN:
+                    self._settings_commit_edit()
+                elif event.key == pygame.K_ESCAPE:
+                    self._settings_editing = None
+                    self._settings_edit_text = ""
+                    play_sfx('click')
+                elif event.key == pygame.K_BACKSPACE:
+                    self._settings_edit_text = self._settings_edit_text[:-1]
+                    play_sfx('tap', strength=1)
+                elif event.unicode and len(self._settings_edit_text) < 6:
+                    c = event.unicode
+                    allowed = '0123456789.' if self._settings_editing == 'ai_frames' else '0123456789'
+                    if c in allowed and c not in '..' or (c == '.' and '.' not in self._settings_edit_text):
+                        self._settings_edit_text += c
+                        play_sfx('tap', strength=1)
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                # 点击条目外任意处 → 提交当前编辑
+                self._settings_commit_edit()
+            return
+
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 play_sfx('click')
                 self.state = STATE_MENU
                 return
             if event.key in (pygame.K_UP, pygame.K_w):
-                self._settings_index = (self._settings_index - 1) % 4
+                self._settings_move_item(-1)
                 play_sfx('tap', strength=2)
             elif event.key in (pygame.K_DOWN, pygame.K_s):
-                self._settings_index = (self._settings_index + 1) % 4
+                self._settings_move_item(1)
                 play_sfx('tap', strength=2)
             elif event.key in (pygame.K_LEFT, pygame.K_a):
                 self._adjust_setting(-1)
             elif event.key in (pygame.K_RIGHT, pygame.K_d):
                 self._adjust_setting(1)
         elif event.type == pygame.MOUSEWHEEL:
-            if event.y > 0:
-                self._settings_index = (self._settings_index - 1) % 4
-            else:
-                self._settings_index = (self._settings_index + 1) % 4
+            self._settings_move_item(-1 if event.y > 0 else 1)
             play_sfx('tap', strength=2)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            pos = event.pos
+            # 返回按钮
+            if self._settings_back_rect and self._settings_back_rect.collidepoint(pos):
+                play_sfx('click')
+                self.state = STATE_MENU
+                return
+            # 一级目录：切换分类
+            for idx, rect in getattr(self, '_settings_cat_rects', []):
+                if rect.collidepoint(pos):
+                    if idx != self._settings_cat:
+                        self._settings_cat = idx
+                        self._settings_index = 0
+                        play_sfx('click')
+                    return
+            # 二级条目：点条目选中；端口/AI思考时间点击进入键入；FPS 点 +/- 调整
+            for key, rect, minus_rect, plus_rect in getattr(self, '_settings_item_rects', []):
+                if key in ('port', 'ai_frames') and rect.collidepoint(pos):
+                    for i, item in enumerate(self._SETTINGS_CATS[self._settings_cat][1]):
+                        if item[0] == key:
+                            self._settings_index = i
+                            break
+                    self._settings_editing = key
+                    self._settings_edit_text = ""
+                    play_sfx('click')
+                    return
+                if plus_rect and plus_rect.collidepoint(pos):
+                    self._adjust_setting(1, key=key)
+                    return
+                if minus_rect and minus_rect.collidepoint(pos):
+                    self._adjust_setting(-1, key=key)
+                    return
+                if rect.collidepoint(pos):
+                    for i, item in enumerate(self._SETTINGS_CATS[self._settings_cat][1]):
+                        if item[0] == key:
+                            self._settings_index = i
+                            break
+                    play_sfx('tap', strength=2)
+                    if key == 'reset_ai':
+                        self._reset_ai_weights()
+                    return
 
-    def _adjust_setting(self, direction):
-        """调整当前选中项（direction=-1 减少 / +1 增加），改后立即保存并应用。"""
-        if self._settings_index == 0:      # 最高 FPS
+    def _adjust_setting(self, direction, key=None):
+        """调整设置项（direction=-1 减少 / +1 增加），改后立即保存并应用。
+        仅 FPS 使用增减；端口与 AI 思考时间改为键盘键入。"""
+        if key is None:
+            key = self._current_setting_key()
+        if key == 'fps':                 # 最高 FPS
             self._settings_fps = max(15, min(240, self._settings_fps + direction * 5))
-        elif self._settings_index == 1:    # AI 思考时间（秒，上限 1.5s）
-            fps = self._settings_fps
-            seconds = self._settings_ai_frames / fps
-            seconds = max(0.05, min(1.5, round(seconds + direction * 0.05, 2)))
-            self._settings_ai_frames = max(1, min(int(fps * 1.5), round(seconds * fps)))
-        elif self._settings_index == 2:    # 默认端口
-            self._settings_port = max(1024, min(65535, self._settings_port + direction))
-        else:                              # 重置 AI 参数（←/→ 任一方向确认）
-            self._reset_ai_weights()
-            return
-        play_sfx('tap', strength=2)
-        self._apply_settings()
+            play_sfx('tap', strength=2)
+            self._apply_settings()
 
     def _apply_settings(self):
         """先写入当前运行变量，再写回 config.json。"""
@@ -2131,33 +2260,119 @@ class Game:
                                  pygame.time.get_ticks())
         play_sfx('click' if ok else 'heavy_hit')
 
+    def _settings_value_text(self, key):
+        """返回条目的当前值文本（用于右侧显示）。"""
+        if key == 'fps':
+            return f"{self._settings_fps}"
+        elif key == 'ai_frames':
+            fps = self._settings_fps or 1
+            return f"{self._settings_ai_frames / fps:.2f}s"
+        elif key == 'port':
+            return f"{self._settings_port}"
+        return ""
+
     def draw_settings(self, surface):
         surface.fill(BG_COLOR)
         title = font_big.render("设置", True, WHITE)
-        surface.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 120)))
+        surface.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 70)))
 
-        fps = self._settings_fps
-        ai_frames = self._settings_ai_frames
-        ai_seconds = ai_frames / fps if fps else 0
-        rows = [
-            (0, f"最高 FPS: {fps}", "实时生效"),
-            (1, f"AI 思考时间: {ai_seconds:.2f}s ({ai_frames}帧)", "上限 1.5s，实时生效"),
-            (2, f"默认端口: {self._settings_port}", "下次建房/连接生效"),
-            (3, "重置 AI 参数", "←/→ 确认恢复出厂权重"),
-        ]
-        y = 220
-        for idx, label, desc in rows:
-            if idx == self._settings_index:
-                color = (255, 215, 0)
-                prefix = "> "
+        mouse_pos = pygame.mouse.get_pos()
+        cat_x, cat_y = 260, 170
+        cat_w, cat_h = 200, 52
+        item_x, item_y = 520, 170
+        item_w, item_h = 520, 56
+        gap = 12
+
+        # ===== 左栏：一级目录 =====
+        self._settings_cat_rects = []
+        for ci, (cname, items) in enumerate(self._SETTINGS_CATS):
+            rect = pygame.Rect(cat_x, cat_y + ci * (cat_h + gap), cat_w, cat_h)
+            is_active = (ci == self._settings_cat)
+            hover = rect.collidepoint(mouse_pos)
+            if is_active:
+                c = (60, 110, 170)
+            elif hover:
+                c = (70, 70, 95)
             else:
-                color = WHITE
-                prefix = "  "
-            txt = font_mid.render(prefix + label, True, color)
-            surface.blit(txt, (SCREEN_WIDTH // 2 - 170, y))
-            d = font_small.render(desc, True, GRAY)
-            surface.blit(d, (SCREEN_WIDTH // 2 + 110, y + 5))
-            y += 48
+                c = (45, 45, 65)
+            pygame.draw.rect(surface, c, rect, border_radius=6)
+            pygame.draw.rect(surface, (180, 200, 230) if is_active else WHITE, rect, 2, border_radius=6)
+            label = font_mid.render(cname, True, WHITE)
+            surface.blit(label, label.get_rect(center=rect.center))
+            self._settings_cat_rects.append((ci, rect))
+
+        # ===== 右栏：二级条目 =====
+        self._settings_item_rects = []
+        cur_items = self._SETTINGS_CATS[self._settings_cat][1]
+        for ii, (key, label, desc) in enumerate(cur_items):
+            rect = pygame.Rect(item_x, item_y + ii * (item_h + gap), item_w, item_h)
+            is_sel = (ii == self._settings_index)
+            is_edit = (self._settings_editing == key)
+            hover = rect.collidepoint(mouse_pos)
+            if is_edit:
+                c = (40, 60, 90)
+            elif is_sel:
+                c = (90, 70, 40)
+            elif hover:
+                c = (70, 70, 95)
+            else:
+                c = (45, 45, 65)
+            pygame.draw.rect(surface, c, rect, border_radius=6)
+            border_col = (120, 200, 255) if is_edit else ((255, 215, 0) if is_sel else WHITE)
+            pygame.draw.rect(surface, border_col, rect, 2, border_radius=6)
+
+            # 左侧：标签（第1行）+ 描述（第2行，提高行距避免重叠）
+            lb = font_mid.render(label, True, WHITE)
+            surface.blit(lb, (rect.x + 14, rect.y + 6))
+            db = font_small.render(desc, True, (150, 150, 160))
+            surface.blit(db, (rect.x + 14, rect.y + 34))
+
+            # 右侧值区域（垂直居中，避免与描述重叠）
+            plus_rect = minus_rect = None
+            if key == 'fps':
+                btn_w, btn_h = 36, 32
+                plus_rect = pygame.Rect(rect.right - btn_w - 12, rect.centery - btn_h // 2, btn_w, btn_h)
+                minus_rect = pygame.Rect(plus_rect.x - 12 - btn_w, rect.centery - btn_h // 2, btn_w, btn_h)
+                # 值文本右对齐到减号按钮左侧，避免被按钮遮挡
+                val = font_mid.render(f"{self._settings_fps}", True, (255, 215, 0))
+                val_rect = val.get_rect(right=minus_rect.left - 14, centery=rect.centery)
+                surface.blit(val, val_rect)
+                for _r, _sym in ((minus_rect, "−"), (plus_rect, "+")):
+                    _h = _r.collidepoint(mouse_pos)
+                    pygame.draw.rect(surface, (90, 120, 90) if _h else (60, 80, 60), _r, border_radius=4)
+                    pygame.draw.rect(surface, WHITE, _r, 1, border_radius=4)
+                    _t = font_mid.render(_sym, True, WHITE)
+                    surface.blit(_t, _t.get_rect(center=_r.center))
+            elif key in ('port', 'ai_frames'):
+                # 值 + 输入框；编辑中显示输入文本与光标
+                val_box = pygame.Rect(rect.right - 230, rect.centery - 17, 210, 34)
+                pygame.draw.rect(surface, (25, 30, 45), val_box, border_radius=4)
+                pygame.draw.rect(surface, (120, 200, 255) if is_edit else (90, 100, 120), val_box, 1, border_radius=4)
+                if is_edit:
+                    disp = self._settings_edit_text + "|"
+                else:
+                    disp = self._settings_value_text(key)
+                vt = font_mid.render(disp, True, (255, 215, 0) if not is_edit else WHITE)
+                surface.blit(vt, (val_box.x + 8, val_box.y + (val_box.h - vt.get_height()) // 2))
+            elif key == 'reset_ai':
+                hb = rect.collidepoint(mouse_pos)
+                pygame.draw.rect(surface, (150, 60, 60) if hb else (110, 45, 45),
+                                 pygame.Rect(rect.right - 130, rect.centery - 15, 116, 30), border_radius=4)
+                pygame.draw.rect(surface, WHITE,
+                                 pygame.Rect(rect.right - 130, rect.centery - 15, 116, 30), 1, border_radius=4)
+                bt = font_small.render("重置", True, WHITE)
+                surface.blit(bt, bt.get_rect(center=(rect.right - 72, rect.centery)))
+
+            self._settings_item_rects.append((key, rect, minus_rect, plus_rect))
+
+        # ===== 底部返回按钮 =====
+        back_rect = pygame.Rect(SCREEN_WIDTH - 120, SCREEN_HEIGHT - 50, 100, 34)
+        h = back_rect.collidepoint(mouse_pos)
+        pygame.draw.rect(surface, GREEN if h else (40, 140, 40), back_rect, border_radius=6)
+        pygame.draw.rect(surface, WHITE, back_rect, 2, border_radius=6)
+        bt = font_small.render("返回", True, WHITE)
+        surface.blit(bt, bt.get_rect(center=back_rect.center))
+        self._settings_back_rect = back_rect
 
         # 临时提示（如"AI 参数已重置"），2.5 秒后消失
         notice = getattr(self, '_settings_notice', None)
@@ -2165,9 +2380,12 @@ class Game:
             msg, tick = notice
             if pygame.time.get_ticks() - tick < 2500:
                 nt = font_small.render(msg, True, (140, 255, 140))
-                surface.blit(nt, nt.get_rect(center=(SCREEN_WIDTH // 2, y + 20)))
+                surface.blit(nt, nt.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 100)))
 
-        tip = font_tiny.render("↑/↓ 选择 | ←/→ 调整（修改立即保存） | Esc 返回", True, DARK_GRAY)
+        if self._settings_editing:
+            tip = font_tiny.render("输入数字后回车确认 | Esc 取消 | 点击其他位置提交", True, (120, 200, 255))
+        else:
+            tip = font_tiny.render("鼠标点击选择 | 端口/AI思考时间: 点击输入 | FPS: [-] [+] | ↑/↓ 选择 | Esc 返回", True, DARK_GRAY)
         surface.blit(tip, tip.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 40)))
 
     def _enter_replay_select(self):
