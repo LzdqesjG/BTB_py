@@ -97,10 +97,11 @@ def add_debug_log(text, color=(-1, -1, -1), duration_ms=None):
         return
     if color == (-1, -1, -1):
         color = randcolor("noblack")
-    texter = f"[DEBUG] {text}"
-    tick = pygame.time.get_ticks()
-    dur = duration_ms if duration_ms is not None else DEFAULT_DEBUG_DURATION
-    _debug_entries.append((texter, color, tick, dur))
+    if "SHOW_DEBUG_INFO" in DEBUGS:
+        texter = f"[DEBUG] {text}"
+        tick = pygame.time.get_ticks()
+        dur = duration_ms if duration_ms is not None else DEFAULT_DEBUG_DURATION
+        _debug_entries.append((texter, color, tick, dur))
     if "PRINT_DEBUG_INFO" in DEBUGS:
         log.debug(text)
 
