@@ -70,6 +70,16 @@ if os.path.isfile(_AI_JSON):
         _JSON_OVERRIDE = {}
 
 
+def _reload_override():
+    """重新从 ai.json 加载运行时覆盖，使文件改动在本进程内立即生效。"""
+    global _JSON_OVERRIDE
+    try:
+        with open(_AI_JSON, 'r', encoding='utf-8') as _fh:
+            _JSON_OVERRIDE = json.load(_fh) or {}
+    except Exception:
+        _JSON_OVERRIDE = {}
+
+
 # ===== 权重文件读写 / 备份 / 学习数据 (AI 自动学习基础设施) =====
 
 def _now_tag():
@@ -98,6 +108,7 @@ def save_weights(cfg):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(cfg.to_dict(), f, indent=2, ensure_ascii=False)
         os.replace(tmp, _AI_JSON)
+        _reload_override()  # 本进程内立即生效
         return True
     except Exception:
         try:
@@ -134,6 +145,22 @@ def _save_learn(data):
         except Exception:
             pass
         return False
+
+
+def reset_weights():
+    """把 AI/ai.json 恢复为 AIConfig 内置出厂默认值（去掉运行时覆盖与学习微调）。
+
+    重置前自动备份当前 ai.json（AI/backup/）。成功后重新加载运行时覆盖，
+    使重置在当前进程内立即生效。返回 True 表示成功。
+    """
+    saved = dict(_JSON_OVERRIDE)
+    _JSON_OVERRIDE.clear()
+    try:
+        cfg = AIConfig()  # 无覆盖 → 得到出厂默认权重
+    finally:
+        _JSON_OVERRIDE.update(saved)
+    return save_weights(cfg)
+
 
 # ============================================================
 # 常量 (由游戏常量推导, 保证与 anti_cheat / main 完全一致)
@@ -546,23 +573,23 @@ class AIThinker:
                 else:
                     break
             if not win and streak >= 3:
-                cfg.risk_taker *= 0.90          # 降低冒险度
-                cfg.spend_mid *= 0.95           # 花费更保守
-                cfg.hub_preference *= 0.95      # 减少高风险枢纽击杀
-                cfg.threat_mul *= 1.06          # 提升威胁感知
-                cfg.collect_low *= 1.10         # 更积极收集保点数
+                cfg.risk_taker *= 0.96          # 降低冒险度（小步微调，防权重震荡）
+                cfg.spend_mid *= 0.98           # 花费更保守
+                cfg.hub_preference *= 0.98      # 减少高风险枢纽击杀
+                cfg.threat_mul *= 1.03          # 提升威胁感知
+                cfg.collect_low *= 1.05         # 更积极收集保点数
                 learn['last_adjust'] = 'conservative'
             elif win and streak >= 3:
-                cfg.risk_taker *= 1.05          # 小幅恢复冒险
-                cfg.spend_mid *= 1.03
-                cfg.threat_mul *= 0.98
+                cfg.risk_taker *= 1.03          # 小幅恢复冒险
+                cfg.spend_mid *= 1.02
+                cfg.threat_mul *= 0.99
                 learn['last_adjust'] = 'aggressive'
 
         # ---- 对手行为应对：对手爱强化 → 提高威胁感知 ----
         if os_ and os_.get('total'):
             reinf = os_['strong'] / os_['total']
             if reinf > 0.5:
-                cfg.threat_mul = min(3.0, cfg.threat_mul * 1.03)
+                cfg.threat_mul = min(3.0, cfg.threat_mul * 1.02)
 
         cfg._apply_clip()
         save_weights(cfg)

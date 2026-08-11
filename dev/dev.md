@@ -127,8 +127,7 @@ BTB_py/
 │
 ├── .github/
 │   └── workflows/
-│       ├── release-cd.yml   # GitHub Actions：打 tag 自动发布 ZIP Release
-│       └── issues-export.yml# GitHub Actions：Issue 变更时自动导出到 ISSUES.md
+│       └── release-cd.yml   # GitHub Actions：打 tag 自动发布 ZIP Release
 │
 └── replays/                 # 对局回放文件（*.bpr, JSONL 格式）
 ```
@@ -471,6 +470,12 @@ AI 有三层学习能力，全部以 `AI/ai.json`（权重）和 `AI/learn.json`
 ```bash
 python dev/rl_evolve.py --games 8 --mutation 0.12 --seed 42
 ```
+
+**4. 重置 AI 参数（游戏内设置页）**
+- 设置页第 4 行 `重置 AI 参数`：按 ←/→ 确认，把 `AI/ai.json` 恢复为 AIConfig 内置出厂默认值（去掉运行时覆盖与学习微调），写前自动备份
+- `aithink4.py` 提供模块级 `reset_weights()`；`save_weights()` 写盘后调用 `_reload_override()` 重载运行时覆盖，学习/重置在同一进程内立即生效
+
+**学习幅度**：自动微调采用**小步幅**（连败 ×0.96/×0.98/×1.03/×1.05，连胜 ×1.03/×1.02/×0.99），避免权重震荡。
 
 ### AI 托管（#30）
 

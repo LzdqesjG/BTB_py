@@ -1979,7 +1979,8 @@ class Game:
         # AI 思考时间上限 1.5s
         max_frames = max(1, int(self._settings_fps * 1.5))
         self._settings_ai_frames = min(self._settings_ai_frames, max_frames)
-        self._settings_index = 0  # 0=FPS 1=AI思考时间 2=端口
+        self._settings_index = 0  # 0=FPS 1=AI思考时间 2=端口 3=重置AI参数
+        self._settings_notice = None  # 设置页临时提示 (text, tick)
         self.state = STATE_SETTINGS
 
     def _handle_settings_event(self, event):
@@ -1992,10 +1993,10 @@ class Game:
                 self.state = STATE_MENU
                 return
             if event.key in (pygame.K_UP, pygame.K_w):
-                self._settings_index = (self._settings_index - 1) % 3
+                self._settings_index = (self._settings_index - 1) % 4
                 play_sfx('tap', strength=2)
             elif event.key in (pygame.K_DOWN, pygame.K_s):
-                self._settings_index = (self._settings_index + 1) % 3
+                self._settings_index = (self._settings_index + 1) % 4
                 play_sfx('tap', strength=2)
             elif event.key in (pygame.K_LEFT, pygame.K_a):
                 self._adjust_setting(-1)
@@ -2003,9 +2004,9 @@ class Game:
                 self._adjust_setting(1)
         elif event.type == pygame.MOUSEWHEEL:
             if event.y > 0:
-                self._settings_index = (self._settings_index - 1) % 3
+                self._settings_index = (self._settings_index - 1) % 4
             else:
-                self._settings_index = (self._settings_index + 1) % 3
+                self._settings_index = (self._settings_index + 1) % 4
             play_sfx('tap', strength=2)
 
     def _adjust_setting(self, direction):
@@ -2017,8 +2018,11 @@ class Game:
             seconds = self._settings_ai_frames / fps
             seconds = max(0.05, min(1.5, round(seconds + direction * 0.05, 2)))
             self._settings_ai_frames = max(1, min(int(fps * 1.5), round(seconds * fps)))
-        else:                              # 默认端口
+        elif self._settings_index == 2:    # 默认端口
             self._settings_port = max(1024, min(65535, self._settings_port + direction))
+        else:                              # 重置 AI 参数（←/→ 任一方向确认）
+            self._reset_ai_weights()
+            return
         play_sfx('tap', strength=2)
         self._apply_settings()
 
@@ -2049,6 +2053,18 @@ class Game:
         except OSError as e:
             print(f"[CONFIG] 保存配置失败: {e}")
 
+    def _reset_ai_weights(self):
+        """把 AI 权重（AI/ai.json）恢复为出厂默认值，并给出提示。"""
+        try:
+            from AI.aithink4 import reset_weights
+            ok = reset_weights()
+        except Exception as e:
+            ok = False
+            print(f"[AI] 重置失败: {e}")
+        self._settings_notice = (("AI 参数已重置为默认值" if ok else "重置失败，请查看日志"),
+                                 pygame.time.get_ticks())
+        play_sfx('click' if ok else 'heavy_hit')
+
     def draw_settings(self, surface):
         surface.fill(BG_COLOR)
         title = font_big.render("设置", True, WHITE)
@@ -2061,6 +2077,7 @@ class Game:
             (0, f"最高 FPS: {fps}", "实时生效"),
             (1, f"AI 思考时间: {ai_seconds:.2f}s ({ai_frames}帧)", "上限 1.5s，实时生效"),
             (2, f"默认端口: {self._settings_port}", "下次建房/连接生效"),
+            (3, "重置 AI 参数", "←/→ 确认恢复出厂权重"),
         ]
         y = 220
         for idx, label, desc in rows:
@@ -2075,6 +2092,14 @@ class Game:
             d = font_small.render(desc, True, GRAY)
             surface.blit(d, (SCREEN_WIDTH // 2 + 110, y + 5))
             y += 48
+
+        # 临时提示（如"AI 参数已重置"），2.5 秒后消失
+        notice = getattr(self, '_settings_notice', None)
+        if notice:
+            msg, tick = notice
+            if pygame.time.get_ticks() - tick < 2500:
+                nt = font_small.render(msg, True, (140, 255, 140))
+                surface.blit(nt, nt.get_rect(center=(SCREEN_WIDTH // 2, y + 20)))
 
         tip = font_tiny.render("↑/↓ 选择 | ←/→ 调整（修改立即保存） | Esc 返回", True, DARK_GRAY)
         surface.blit(tip, tip.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT - 40)))
