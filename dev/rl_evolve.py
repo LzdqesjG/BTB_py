@@ -28,14 +28,16 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-import main  # noqa: E402  (dummy 视频驱动，不弹窗口)
+import main as mainmod  # noqa: E402  (dummy 视频驱动，不弹窗口)
+# 注意: 不能用 `import main` 原名 —— 下方 def main() 会覆盖全局名,
+# 导致 main.Game() 解析到函数对象。用 mainmod 别名避免。
 from AI.aithink4 import AIConfig, AIThinker, save_weights  # noqa: E402
 
 
 def play_match(game, red_cfg, blue_cfg, max_turns=300):
     """用给定权重跑一局 AI vs AI，返回 (winner, turns)。winner=None 表示超时平局。"""
     game.reset(game_info={'mode': 'ai'})
-    game.state = main.STATE_PLAYING
+    game.state = mainmod.STATE_PLAYING
     turns = 0
     while game.winner is None and turns < max_turns:
         turns += 1
@@ -82,7 +84,7 @@ def main():
     base = AIConfig()  # 当前 ai.json 权重
     mutant = mutate(base, args.mutation)
 
-    game = main.Game()
+    game = mainmod.Game()
     win_b = win_m = draw = 0
     print(f"基准权重 vs 变异权重 (±{int(args.mutation * 100)}%), {args.games} 局")
     for i in range(args.games):
