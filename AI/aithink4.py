@@ -69,6 +69,30 @@ if os.path.isfile(_AI_JSON):
     except Exception:
         _JSON_OVERRIDE = {}
 
+# ---- C 扩展几何加速 (可选): AI/btb_geo.dll 存在时自动启用 ----
+# 加速自对弈训练 (dev/rl_evolve.py / AI 对弈模式) 的热点几何计算。
+# DLL 缺失时 FAST_GEO=False, 走纯 Python 实现, 行为逐位一致。
+try:
+    from AI.fast_geo import (FAST_GEO, HitStats, GeoPack,
+                             pt_seg_dist_grid, dists_to)
+except Exception:
+    try:
+        from fast_geo import (FAST_GEO, HitStats, GeoPack,
+                              pt_seg_dist_grid, dists_to)
+    except Exception:
+        from collections import namedtuple as _nt
+        HitStats = _nt('HitStats',
+                       ['hit_root', 'nodes_hit', 'hub_value', 'edges_hit',
+                        'edges_dead', 'spine_cut', 'pinned',
+                        'collect_value', 'collect_grav'])
+        FAST_GEO = False
+        GeoPack = None
+        pt_seg_dist_grid = None
+        dists_to = None
+# 环境变量可强制关闭 C 加速 (对照基准/调试用)
+if os.environ.get('BTB_NO_FAST'):
+    FAST_GEO = False
+
 
 def _reload_override():
     """重新从 ai.json 加载运行时覆盖，使文件改动在本进程内立即生效。"""
@@ -1204,10 +1228,60 @@ class AIThinker:
         return cnt
 
     # ============================================================
+    # 几何命中统计 (收集/节点/边/压制) — 一条移动的所有几何量一次算完
+    # 纯 Python 参考实现, 与 C 扩展 btb_analyze_moves 逐位等价。
+    # fast 模式 (FAST_GEO) 下由 GeoPack 批量预计算后经 st 参数传入。
+    # ============================================================
+    def _hit_stats(self, src, tgt, atk, en_nodes, en_edges, pickups, spine=None):
+        hit_root = False
+        nodes_hit = 0
+        hub_value = 0
+        spine_cut = 0
+        for n in en_nodes:
+            if (n.x == src[0] and n.y == src[1]) or (n.x == tgt[0] and n.y == tgt[1]):
+                continue
+            if _seg_hits_circle(src[0], src[1], tgt[0], tgt[1],
+                                n.x, n.y, NODE_RADIUS):
+                if n.parent is None:
+                    hit_root = True
+                    break
+                nodes_hit += 1
+                hub_value += self.subtree_size(n)
+                if spine and n.id in spine:
+                    spine_cut += 1
+        if hit_root:
+            return HitStats(1, 0, 0.0, 0, 0, 0, 0, 0.0, 0.0)
+        edges_hit = 0
+        edges_dead = 0
+        for (ex1, ey1, ex2, ey2, est, child) in en_edges:
+            if _seg_cross(src, (tgt[0], tgt[1]), (ex1, ey1), (ex2, ey2)):
+                edges_hit += 1
+                if est <= atk:
+                    edges_dead += 1
+                if spine and child.id in spine:
+                    spine_cut += 1
+        pinned = 0
+        for n in en_nodes:
+            if len(n.children) < MAX_CHILDREN:
+                d = _dist(tgt[0], tgt[1], n.x, n.y)
+                if 20 < d < 55:
+                    pinned += 1
+        collect_value = 0.0
+        collect_grav = 0.0
+        for sp in pickups:
+            d = _dist(tgt[0], tgt[1], sp.x, sp.y)
+            if d < PICKUP_COLLECT_DIST:
+                collect_value += sp.value
+            elif d < 130:
+                collect_grav += sp.value * (1.0 - d / 130.0)
+        return HitStats(0, nodes_hit, hub_value, edges_hit, edges_dead,
+                        spine_cut, pinned, collect_value, collect_grav)
+
+    # ============================================================
     # 多维度静态评分 (移植自 C++ scoreTarget)
     # ============================================================
     def score_target(self, parent, tgt, str_, range_index, spend_mult,
-                     dyn, en_nodes, en_edges, pickups):
+                     dyn, en_nodes, en_edges, pickups, st=None):
         dyn_atk, dyn_exp, dyn_dfn, dyn_col = dyn
         cfg = self.cfg
         sit = self.sit
@@ -1258,52 +1332,32 @@ class AIThinker:
                 if _sector(tx - en_root.x, ty - en_root.y) == sit.en_flank_gap_angle:
                     s += 22.0 * dyn_atk
 
-        # ---- 收集 (Python: 节点碰包) ----
-        collected = False
-        collect_value = 0.0
-        for sp in pickups:
-            d = _dist(tx, ty, sp.x, sp.y)
-            if d < PICKUP_COLLECT_DIST:
-                collected = True
-                collect_value += sp.value
-                s += sp.value * (cfg.collect_low if spend_mult > 3 else cfg.collect) * dyn_col
-                s += sp.value * 5.0     # 黄点未来积分现值
-            elif d < 130:
-                s += sp.value * 2.0 * (1.0 - d / 130.0) * dyn_col
+        # ---- 几何统计 (收集/节点命中/边命中/压制) — fast 模式由 C 批量预计算 ----
+        if st is None:
+            st = self._hit_stats(src, (tx, ty), atk, en_nodes, en_edges,
+                                 pickups, getattr(sit, 'enemy_spine', None))
+        hit_root = st.hit_root
+        nodes_hit = st.nodes_hit
+        hub_value = st.hub_value
+        edges_hit = st.edges_hit
+        edges_dead = st.edges_dead
+        spine_cut = st.spine_cut
+        pinned = st.pinned
+        collect_value = st.collect_value
+        collect_grav = st.collect_grav
+
+        # ---- 收集加分 (聚合值: 与原逐包累加最多差 1 ulp, 不影响决策) ----
+        if collect_value > 0:
+            s += collect_value * (cfg.collect_low if spend_mult > 3 else cfg.collect) * dyn_col
+            s += collect_value * 5.0     # 黄点未来积分现值
+        s += collect_grav * 2.0 * dyn_col
         # 收集经济性: 花范围延长去够黄点必须物有所值
-        if range_index > 0 and collected and collect_value < range_index:
+        if range_index > 0 and collect_value > 0 and collect_value < range_index:
             s -= (range_index - collect_value) * 20.0 * spend_mult
 
-        # ---- 节点命中 (含主轴拦截奖励: 切断人类进攻链) ----
-        nodes_hit = 0
-        hub_value = 0
-        hit_root = False
-        spine = getattr(sit, 'enemy_spine', set()) or set()
-        spine_cut = 0
-        for n in en_nodes:
-            if (n.x == src[0] and n.y == src[1]) or (n.x == tx and n.y == ty):
-                continue
-            if _seg_hits_circle(src[0], src[1], tx, ty, n.x, n.y, NODE_RADIUS):
-                if n.parent is None:
-                    hit_root = True
-                    break
-                nodes_hit += 1
-                hub_value += self.subtree_size(n)
-                if n.id in spine:
-                    spine_cut += 1
         if hit_root:
             return 10000.0
 
-        # ---- 边命中 (含主轴边拦截) ----
-        edges_hit = 0
-        edges_dead = 0
-        for (ex1, ey1, ex2, ey2, est, child) in en_edges:
-            if _seg_cross(src, (tx, ty), (ex1, ey1), (ex2, ey2)):
-                edges_hit += 1
-                if est <= atk:
-                    edges_dead += 1
-                if child.id in spine:
-                    spine_cut += 1
         # 动态拦截奖励: 切断敌方进攻主轴 (链式冲刺的命门)
         if spine_cut > 0:
             s += spine_cut * 400.0 * dyn_dfn
@@ -1315,13 +1369,13 @@ class AIThinker:
 
         # 从根节点开新枝且无战果 → 惩罚 (鼓励从已有前线推进)
         if parent.parent is None and len(parent.children) >= 1:
-            if nodes_hit == 0 and edges_hit == 0 and not collected:
+            if nodes_hit == 0 and edges_hit == 0 and collect_value == 0:
                 s -= 15.0
         elif parent.parent is not None:
             s += 4.0
 
         # 花范围延长却无任何战果 → 重罚
-        if range_index > 0 and nodes_hit == 0 and edges_hit == 0 and not collected:
+        if range_index > 0 and nodes_hit == 0 and edges_hit == 0 and collect_value == 0:
             s -= range_index * 10.0 * spend_mult
 
         # ---- 连击 ----
@@ -1357,7 +1411,7 @@ class AIThinker:
             s += adv_eff * cfg.advance * dyn_atk * adv_boost
         else:
             s += adv_gain * cfg.advance * dyn_atk
-        if collected and d_to > d_from:
+        if collect_value > 0 and d_to > d_from:
             s += (d_to - d_from) * cfg.advance * 0.6
 
         # ---- 链式推进奖励 (回放学习: 人类 58% 落子沿"父→敌根"直线延伸) ----
@@ -1379,13 +1433,7 @@ class AIThinker:
         if d_c < 300:
             s += (300 - d_c) * cfg.center
 
-        # ---- 压制敌方可扩展节点 ----
-        pinned = 0
-        for n in en_nodes:
-            if len(n.children) < MAX_CHILDREN:
-                d = _dist(tx, ty, n.x, n.y)
-                if 20 < d < 55:
-                    pinned += 1
+        # ---- 压制敌方可扩展节点 (几何统计已含 pinned) ----
         s += pinned * 8.0 * dyn_atk
 
         # ---- 开拓版图 ----
@@ -1464,21 +1512,46 @@ class AIThinker:
             pen += (45 - d_en) * 3.0
 
         # 敌方可扩展节点能延伸打击此落点
-        for e in en_expandable:
-            d = _dist(e.x, e.y, tx, ty)
-            if d < 20 or d > MAX_RANGE:
-                continue
-            ri = _range_index(d)
-            if ri is None or ri > 2:
-                continue
-            blocked = False
-            for o in self.game.nodes:
-                if o.team == self.team and o is not parent:
-                    if _pt_seg_dist(o.x, o.y, e.x, e.y, tx, ty) < _OCCUPY_BLOCK:
-                        blocked = True
-                        break
-            if not blocked:
-                pen += 14.0 * cfg.threat_mul
+        if FAST_GEO:
+            # fast 模式: 己方节点为点集, 敌延伸线段 (e→tgt) 为线段集, 一次 C 距离矩阵
+            my_pts = [(o.x, o.y) for o in self.game.nodes
+                      if o.team == self.team and o is not parent]
+            valid_e = []
+            for e in en_expandable:
+                d = _dist(e.x, e.y, tx, ty)
+                if d < 20 or d > MAX_RANGE:
+                    continue
+                ri = _range_index(d)
+                if ri is None or ri > 2:
+                    continue
+                valid_e.append((e, (e.x, e.y, tx, ty)))
+            if not my_pts:
+                # 无己方节点可阻挡 → 全部视为未拦截 (与原 Python 循环等价)
+                for e, _ in valid_e:
+                    pen += 14.0 * cfg.threat_mul
+            elif valid_e:
+                n_seg = len(valid_e)
+                ds = pt_seg_dist_grid(my_pts, [s[1] for s in valid_e])
+                n_pts = len(my_pts)
+                for idx, (e, _) in enumerate(valid_e):
+                    if min(ds[i * n_seg + idx] for i in range(n_pts)) >= _OCCUPY_BLOCK:
+                        pen += 14.0 * cfg.threat_mul
+        else:
+            for e in en_expandable:
+                d = _dist(e.x, e.y, tx, ty)
+                if d < 20 or d > MAX_RANGE:
+                    continue
+                ri = _range_index(d)
+                if ri is None or ri > 2:
+                    continue
+                blocked = False
+                for o in self.game.nodes:
+                    if o.team == self.team and o is not parent:
+                        if _pt_seg_dist(o.x, o.y, e.x, e.y, tx, ty) < _OCCUPY_BLOCK:
+                            blocked = True
+                            break
+                if not blocked:
+                    pen += 14.0 * cfg.threat_mul
 
         # 敌方节点本身的距离惩罚
         for e in en_nodes:
@@ -1589,7 +1662,11 @@ class AIThinker:
     # 轻量前向模拟 (移植自 C++ simulateLookahead)
     # ============================================================
     def _sim_best_move(self, sim, team):
-        """在模拟局面中贪心求某方最佳移动 (用简化静态分)。"""
+        """在模拟局面中贪心求某方最佳移动 (用简化静态分)。
+
+        fast 模式: 候选一次性收集后交给 C 批量分析命中统计 (btb_analyze_moves),
+        评分只做浮点加权, 几何循环全部在 C 侧完成。
+        """
         best = None
         best_s = -1e18
         my_r = sim.my_root if team == self.team else sim.en_root
@@ -1598,6 +1675,7 @@ class AIThinker:
             return None
         expand = [sn for sn in sim.all if sn.team == team and len(sn.children) < MAX_CHILDREN]
         expand.sort(key=lambda sn: _dist(sn.x, sn.y, en_r.x, en_r.y))
+        raw = []
         for sn in expand[:6]:
             dx = en_r.x - sn.x
             dy = en_r.y - sn.y
@@ -1631,51 +1709,84 @@ class AIThinker:
                     cost = ri + (str_ - MIN_STRENGTH)
                     if cost > 8:       # 模拟中给一个宽松预算
                         continue
-                    sc = self._sim_quick_score(sn, t, str_, ri, sim, team)
-                    if sc > best_s:
-                        best_s = sc
-                        best = (sn, t, str_, ri)
+                    raw.append((sn, t, str_, ri))
+        if not raw:
+            return None
+        if FAST_GEO:
+            geo = GeoPack(sim.all, team, self.game.pickups, NODE_RADIUS,
+                          PICKUP_COLLECT_DIST,
+                          subtree_fn=lambda sn: sn.subtree(),
+                          spine_ids=None,
+                          max_children=MAX_CHILDREN)
+            sts = geo.analyze_moves([(sn.x, sn.y, t[0], t[1], str_)
+                                     for (sn, t, str_, ri) in raw])
+            # 推进距离 d_to/d_from 也批量 (en_r 固定, 两次 C 调用)
+            tgt_pts = [(t[0], t[1]) for (_, t, _, _) in raw]
+            src_pts = [(sn.x, sn.y) for (sn, _, _, _) in raw]
+            d_tos = dists_to(en_r.x, en_r.y, tgt_pts)
+            d_froms = dists_to(en_r.x, en_r.y, src_pts)
+            scores = []
+            for i, (sn, t, str_, ri) in enumerate(raw):
+                sc = self._sim_quick_score(sn, t, str_, ri, sim, team,
+                                           st=sts[i],
+                                           dists=(d_froms[i], d_tos[i]))
+                scores.append((sc, sn, t, str_, ri))
+            scores.sort(key=lambda x: -x[0])
+            # 1ulp 安全: 批量分与 Python 参考分最多差 1 ulp (hypot 实现差异)。
+            # 前几名分差过近时 (<1e-6) 用 Python 精确重算, 消除排序翻转;
+            # 正常情况下 top1 分差远大于 1e-6, 零重算开销。
+            need = 1
+            while need < min(len(scores), 16) and \
+                    scores[need][0] >= scores[0][0] - 1e-6:
+                need += 1
+            for j in range(need):
+                _, sn, t, str_, ri = scores[j]
+                scores[j] = (self._sim_quick_score(sn, t, str_, ri, sim, team),
+                             sn, t, str_, ri)
+            scores.sort(key=lambda x: -x[0])
+            best = scores[0][1:]
+            best_s = scores[0][0]
+        else:
+            for (sn, t, str_, ri) in raw:
+                sc = self._sim_quick_score(sn, t, str_, ri, sim, team)
+                if sc > best_s:
+                    best_s = sc
+                    best = (sn, t, str_, ri)
         return best
 
-    def _sim_quick_score(self, parent, tgt, str_, ri, sim, team):
+    def _sim_quick_score(self, parent, tgt, str_, ri, sim, team, st=None,
+                         dists=None):
         s = 0.5
         src = (parent.x, parent.y)
         tx, ty = tgt
         enemy = self.enemy_team if team == self.team else self.team
         en_root = sim.en_root if team == self.team else sim.my_root
-        # 命中节点
-        nodes_hit = 0
-        hub = 0
-        for sn in sim.all:
-            if sn.team != enemy:
-                continue
-            if (sn.x == src[0] and sn.y == src[1]) or (sn.x == tx and sn.y == ty):
-                continue
-            if _seg_hits_circle(src[0], src[1], tx, ty, sn.x, sn.y, NODE_RADIUS):
-                if sn.parent is None:
-                    return 10000.0
-                nodes_hit += 1
-                hub += sn.subtree()
-        # 命中边
-        edges_hit = 0
-        edges_dead = 0
-        for sn in sim.all:
-            if sn.team == enemy and sn.parent is not None:
-                if _seg_cross(src, (tx, ty), (sn.parent.x, sn.parent.y), (sn.x, sn.y)):
-                    edges_hit += 1
-                    if sn.strength <= str_:
-                        edges_dead += 1
+        # 命中统计 (fast 模式由 _sim_best_move 批量预计算后传入 st)
+        if st is None:
+            en_nodes = [sn for sn in sim.all if sn.team == enemy]
+            en_edges = [(sn.parent.x, sn.parent.y, sn.x, sn.y, sn.strength, sn)
+                        for sn in sim.all if sn.team == enemy and sn.parent is not None]
+            st = self._hit_stats(src, tgt, str_, en_nodes, en_edges,
+                                 self.game.pickups, None)
+        if st.hit_root:
+            return 10000.0
+        nodes_hit = st.nodes_hit
+        hub = st.hub_value
+        edges_hit = st.edges_hit
+        edges_dead = st.edges_dead
         atk = str_
         s += nodes_hit * self.cfg.node_hit * atk + hub * self.cfg.hub_factor * atk
         s += edges_dead * self.cfg.edge_kill * atk + (edges_hit - edges_dead) * self.cfg.edge_hit
-        # 推进
-        d_to = _dist(tx, ty, en_root.x, en_root.y)
-        d_from = _dist(src[0], src[1], en_root.x, en_root.y)
+        # 推进 (fast 模式由 _sim_best_move 用 C 批量算好传入)
+        if dists is not None:
+            d_from, d_to = dists
+        else:
+            d_to = _dist(tx, ty, en_root.x, en_root.y)
+            d_from = _dist(src[0], src[1], en_root.x, en_root.y)
         s += (d_from - d_to) * self.cfg.advance
-        # 收集 (近似: 落点碰包)
-        for sp in self.game.pickups:
-            if _dist(tx, ty, sp.x, sp.y) < PICKUP_COLLECT_DIST:
-                s += sp.value * self.cfg.collect + sp.value * 5.0
+        # 收集 (近似: 落点碰包; 聚合值与原逐包累加最多差 1 ulp)
+        if st.collect_value > 0:
+            s += st.collect_value * self.cfg.collect + st.collect_value * 5.0
         s -= (ri + (str_ - MIN_STRENGTH)) * 2.0
         return s
 
@@ -1772,6 +1883,7 @@ class AIThinker:
         dyn = self._dynamic_multipliers()
 
         all_cands = []
+        raw = []    # (n, t, str_, ri) — 候选先收集, 评分统一走 fast/纯 Python 路径
         for n in expandables:
             targets = self.gen_targets(n, nodes, en_root, pickups)
             for t in targets:
@@ -1793,18 +1905,35 @@ class AIThinker:
                         break
                     if self.cfg.max_move_cost > 0 and cost > self.cfg.max_move_cost:
                         break   # 单次落子花费上限 (防点数枯竭)
-                    sc = self.score_target(n, t, str_, ri, spend_mult, dyn,
-                                           en_nodes, en_edges, pickups)
-                    all_cands.append((sc, n, t, str_, ri))
-                    if len(all_cands) >= cap:
+                    raw.append((n, t, str_, ri))
+                    if len(raw) >= cap:
                         break
-                if len(all_cands) >= cap:
+                if len(raw) >= cap:
                     break
-            if len(all_cands) >= cap:
+            if len(raw) >= cap:
                 break
 
-        if not all_cands:
+        if not raw:
             return None
+
+        if FAST_GEO:
+            # fast 模式: 一次 C 调用算完全部候选的几何命中统计
+            geo = GeoPack(nodes, self.team, pickups, NODE_RADIUS,
+                          PICKUP_COLLECT_DIST,
+                          subtree_fn=self.subtree_size,
+                          spine_ids=getattr(self.sit, 'enemy_spine', None) or None,
+                          max_children=MAX_CHILDREN)
+            sts = geo.analyze_moves([(n.x, n.y, t[0], t[1], str_)
+                                     for (n, t, str_, ri) in raw])
+            for i, (n, t, str_, ri) in enumerate(raw):
+                sc = self.score_target(n, t, str_, ri, spend_mult, dyn,
+                                       en_nodes, en_edges, pickups, st=sts[i])
+                all_cands.append((sc, n, t, str_, ri))
+        else:
+            for (n, t, str_, ri) in raw:
+                sc = self.score_target(n, t, str_, ri, spend_mult, dyn,
+                                       en_nodes, en_edges, pickups)
+                all_cands.append((sc, n, t, str_, ri))
 
         # 威胁惩罚 (只对 top 候选做, 节省性能)
         all_cands.sort(key=lambda c: -c[0])
